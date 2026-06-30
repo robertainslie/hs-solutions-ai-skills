@@ -1,0 +1,35 @@
+{
+  "name": "crm-schema-audit",
+  "version": "0.1.0",
+  "description": "Audit your HubSpot CRM schema: find duplicate properties, visualize your data model as ERDs, and get a cleanup roadmap.",
+  "author": {
+    "name": "HubSpot Solutions"
+  },
+  "commands": [
+    {
+      "name": "audit",
+      "description": "Run a full CRM schema audit and generate an HTML report",
+      "path": "commands/audit.md"
+    }
+  ],
+  "skills": [
+    {
+      "name": "crm-schema-audit",
+      "path": "../skill.md"
+    }
+  ],
+  "requirements": {
+    "env": [
+      {
+        "name": "HUBSPOT_ACCESS_TOKEN",
+        "description": "HubSpot Private App token with crm.schemas.read scope",
+        "required": true
+      },
+      {
+        "name": "HUBSPOT_PORTAL_ID",
+        "description": "HubSpot portal ID for Data Model Viewer links",
+        "required": false
+      }
+    ]
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "@hs-skills/crm",
+  "version": "0.1.0",
+  "description": "HubSpot CRM AI skills — schema auditing, data quality, and more",
+  "private": true,
+  "scripts": {
+    "crm-schema-audit": "node skills/crm-schema-audit/src/audit.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

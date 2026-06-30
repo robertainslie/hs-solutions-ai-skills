@@ -1,0 +1,30 @@
+{
+  "name": "your-skill-name",
+  "version": "0.1.0",
+  "description": "One-line description under 125 characters.",
+  "author": {
+    "name": "HubSpot Solutions"
+  },
+  "commands": [
+    {
+      "name": "run",
+      "description": "Run this skill",
+      "path": "commands/run.md"
+    }
+  ],
+  "skills": [
+    {
+      "name": "your-skill-name",
+      "path": "../skill.md"
+    }
+  ],
+  "requirements": {
+    "env": [
+      {
+        "name": "HUBSPOT_ACCESS_TOKEN",
+        "description": "HubSpot Private App token",
+        "required": true
+      }
+    ]
+  }
+}

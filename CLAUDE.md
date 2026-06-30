@@ -2,52 +2,80 @@
 
 ## Project Overview
 
-This is a monorepo of reusable HubSpot AI skills. Skills are Markdown-based instructions that tell Claude how to perform specific HubSpot workflows.
+Monorepo of reusable HubSpot AI skills. Skills are Markdown-based instructions that tell Claude how to perform specific HubSpot workflows, paired with implementation scripts.
 
 ## Repository Structure
 
-- `packages/<domain>/skills/<skill-name>/` — one directory per skill
-- `packages/<domain>/skills/<skill-name>/skill.md` — Claude Code skill file
-- `packages/<domain>/skills/<skill-name>/src/` — implementation scripts
-- `skills-index.json` — machine-readable index of all skills
-- `templates/new-skill/` — scaffold for authoring new skills
+```
+packages/<domain>/skills/<skill-name>/
+  skill.md              Claude Code skill file
+  formats/agent-cli.md  HubSpot Agent CLI variant
+  .claude-plugin/       Anthropic Plugin manifest
+  src/                  Implementation scripts (Node.js)
+  README.md             Skill-specific documentation
 
-## Skill Formats
-
-Each skill ships three format variants:
-- `skill.md` — Claude Code (drop into `.claude/skills/`)
-- `SKILL.md` — HubSpot Agent CLI
-- `.claude-plugin/plugin.json` + `commands/` — Anthropic Plugin
+.claude/skills/         Project-scoped skills (auto-loaded)
+skills-index.json       Machine-readable index of all skills
+templates/new-skill/    Scaffold for authoring new skills
+```
 
 ## Running the CRM Schema Audit
 
-Requires `HUBSPOT_ACCESS_TOKEN` environment variable (Private App token with CRM read scopes).
+Requires `HUBSPOT_ACCESS_TOKEN` (Private App token). The script auto-detects the portal ID from the token.
 
 ```bash
-HUBSPOT_ACCESS_TOKEN=pat-na1-... node packages/crm/skills/crm-schema-audit/src/audit.js
+# From any directory (report lands in cwd)
+export HUBSPOT_ACCESS_TOKEN=pat-na1-...
+node packages/crm/skills/crm-schema-audit/src/audit.js
+
+# Faster: skip empty objects
+SKIP_UNUSED=1 node packages/crm/skills/crm-schema-audit/src/audit.js
+
+# Full fix analysis: also count records per duplicate property pair
+CHECK_VALUES=1 node packages/crm/skills/crm-schema-audit/src/audit.js
 ```
 
-Outputs:
-- `audit-data.json` — raw schema data
-- `audit-report.html` — formatted HTML report with ERDs and findings
+**Outputs:**
+- `audit-data.json` — raw data (objects, properties, pipelines, associations, limits, findings, fix plan)
+- `audit-report.html` — interactive report with ERDs, limits dashboard, fix plan
+- `fix-plan.json` — machine-readable fix plan for fix.js
+
+## Running the Fix Script
+
+```bash
+# Dry run (default) — shows what would happen
+node packages/crm/skills/crm-schema-audit/src/fix.js
+
+# Execute interactively
+node packages/crm/skills/crm-schema-audit/src/fix.js --execute
+
+# Use a specific plan file
+node packages/crm/skills/crm-schema-audit/src/fix.js --plan ./reports/fix-plan.json --execute
+```
 
 ## Adding a New Skill
 
 1. Copy `templates/new-skill/` to `packages/<domain>/skills/<skill-name>/`
-2. Fill in `skill.md`, `SKILL.md`, `.claude-plugin/plugin.json`, and `README.md`
+2. Fill in `skill.md`, `formats/agent-cli.md`, `.claude-plugin/plugin.json`, and `README.md`
 3. Add an entry to `skills-index.json`
-4. Add any implementation scripts to `src/`
+4. Add implementation scripts to `src/`
 
 ## HubSpot Authentication
 
 - **Private App token**: HubSpot Settings → Integrations → Private Apps → Create
-  Required scopes for CRM Schema Audit: `crm.schemas.read`, `crm.objects.read`
 - **HubSpot CLI**: `hubspot auth login` then `hubspot accounts use <portalId>`
 - **DevEx MCP**: `hs mcp setup` (requires HubSpot CLI 8.2.0+)
 
+## Gitignored — Do Not Commit
+
+- `.env` — tokens and secrets
+- `.claude/settings.local.json` — personal Claude Code permissions (may contain token paths)
+- `solutions-ai-skills-testing/` — local test output; use this directory for all test runs
+- `audit-data.json`, `audit-report.html`, `fix-plan.json`, `fix-log.json` — generated artifacts
+
 ## Skill Index Format
 
-`skills-index.json` uses this schema per entry:
+`skills-index.json` schema per entry:
 ```json
 {
   "id": "crm-schema-audit",
@@ -57,6 +85,6 @@ Outputs:
   "formats": ["claude-code", "agent-cli", "plugin"],
   "auth": ["HUBSPOT_ACCESS_TOKEN"],
   "path": "packages/crm/skills/crm-schema-audit",
-  "tags": ["crm", "schema", "data-model", "audit"]
+  "tags": ["crm", "schema", "data-model", "audit", "pipelines", "limits"]
 }
 ```

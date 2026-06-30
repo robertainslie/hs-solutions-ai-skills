@@ -1,85 +1,131 @@
 # CRM Schema Audit
 
-Audits a HubSpot portal's full CRM data model and generates an HTML report with Mermaid.js ERD diagrams.
+Audits a HubSpot portal's full CRM data model, generates a prioritized fix plan, and provides an interactive fix script to apply changes safely.
 
 ## What It Does
 
-1. **Collects** all CRM object types (native + custom), all their properties (via HubSpot CLI when available, REST API for full metadata), and all association types between objects
-2. **Analyzes** properties for common issues:
-   - Exact duplicate labels on the same object (Critical)
-   - Highly similar labels — possible duplicates (Warning)
-   - Custom properties missing a description (Warning)
-   - Same label appearing on multiple objects (Info)
-   - Naming convention inconsistencies within an object (Info)
-3. **Generates** an HTML report with:
-   - Summary stat cards
-   - Object inventory table
-   - Three Mermaid.js ERD diagram views (Full Model, Contact-Centric, Deal Pipeline)
-   - Filterable findings table with severity and recommendations
-   - Recommended cleanup order
-   - Link to the [HubSpot Data Model Viewer](https://app.hubspot.com/l/data-model-overview/)
+**audit.js** — collects and analyzes:
+1. All 30+ native CRM object types (contacts, deals, tickets, orders, leads, appointments, etc.) plus custom objects
+2. Record sampling per object — flags which are in use vs. empty
+3. Properties for every object — full metadata including type, fieldType, hasUniqueValue, description, hubspotDefined
+4. Pipelines (with stage breakdown and record counts) for all pipeline-enabled objects
+5. Association types between all accessible object pairs
+6. Property validation rules
+7. CRM limits — records, properties, pipelines, custom objects, association labels
+
+**Finds:**
+| Severity | Issue |
+|----------|-------|
+| Critical | Exact duplicate property labels on the same object |
+| Warning | Near-duplicate labels (possible duplicates) |
+| Warning | Custom properties missing a description |
+| Info | Custom unique identifier properties |
+| Info | Same label across multiple objects |
+| Info | Naming convention inconsistencies |
+
+**Produces a prioritized fix plan** (`fix-plan.json`) with three tiers:
+- **Tier 1** — Auto-fixable with no data risk (archive empty properties, archive empty pipelines)
+- **Tier 2** — Auto-fixable with confirmation (migrate property values then archive, move pipeline records then archive)
+- **Tier 3** — Manual review required (near-duplicates, naming issues)
+
+**fix.js** — reads `fix-plan.json` and executes fixes interactively:
+- Default: `--dry-run` shows exactly what would happen
+- `--execute`: prompts per fix group, migrates records in batches, logs all actions to `fix-log.json`
 
 ## Quick Start
 
 ```bash
-# 1. Get a HubSpot Private App token
-#    HubSpot Settings → Integrations → Private Apps → Create
-#    Required scopes: crm.schemas.read, crm.objects.schemas.read
+# 1. Set your Private App token (see Authentication below)
+export HUBSPOT_ACCESS_TOKEN=pat-na1-...
 
-# 2. Run the audit
-HUBSPOT_ACCESS_TOKEN=pat-na1-... node src/audit.js
+# 2. Run the audit from any directory — report lands here
+cd ~/Desktop
+node ~/hubspot-skills/packages/crm/skills/crm-schema-audit/src/audit.js
 
 # 3. Open the report
 open audit-report.html
+
+# 4. Preview fixes (dry run — no changes made)
+node ~/hubspot-skills/packages/crm/skills/crm-schema-audit/src/fix.js
+
+# 5. Apply fixes interactively
+node ~/hubspot-skills/packages/crm/skills/crm-schema-audit/src/fix.js --execute
 ```
 
 ## Authentication
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `HUBSPOT_ACCESS_TOKEN` | Yes | Private App token with `crm.schemas.read` |
-| `HUBSPOT_PORTAL_ID` | No | Portal ID — enables direct Data Model Viewer link |
-| `OUTPUT_DIR` | No | Directory for output files (default: current directory) |
+Generate a Private App token at: **HubSpot Settings → Integrations → Private Apps → Create app**
 
-## Data Collection Strategy
+### Scopes for audit (read-only)
 
-The script uses a **hybrid CLI + REST API** approach:
+```
+crm.schemas.read              crm.schemas.custom.read
+crm.objects.contacts.read     crm.objects.companies.read
+crm.objects.deals.read        tickets
+crm.objects.goals.read        crm.objects.invoices.read
+crm.objects.leads.read        crm.objects.line_items.read
+crm.objects.orders.read       crm.objects.products.read
+crm.objects.quotes.read       crm.objects.services.read
+crm.objects.appointments.read crm.objects.carts.read
+crm.objects.courses.read      crm.objects.listings.read
+crm.objects.subscriptions.read crm.objects.users.read
+crm.objects.feedback_submissions.read
+crm.objects.custom.read
+```
 
-| Data | Primary | Fallback |
-|------|---------|---------|
-| Custom schemas | `hubspot schemas list` | `GET /crm/v3/schemas` |
-| Properties | `hubspot properties list` + REST supplement | `GET /crm/v3/properties/{type}` |
-| Association types | REST API | — |
+### Additional scopes for fix.js (write)
 
-The CLI is optional — the script automatically falls back to REST if the HubSpot CLI is not installed.
+```
+crm.schemas.contacts.write    crm.schemas.companies.write
+crm.schemas.deals.write       crm.schemas.contacts.write
+crm.objects.contacts.write    crm.objects.companies.write
+crm.objects.deals.write       tickets (includes write)
+```
+
+The audit and fix scripts can use the same token if it has both read and write scopes, or separate tokens.
+
+## Environment Variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `HUBSPOT_ACCESS_TOKEN` | Yes | — | Private App token |
+| `HUBSPOT_PORTAL_ID` | No | auto-detected | Portal ID — auto-resolved from the token via `GET /account-info/v3/details` |
+| `OUTPUT_DIR` | No | cwd | Directory where output files are written |
+| `SKIP_UNUSED` | No | `0` | Set to `1` to skip property collection for objects with no records (faster) |
+| `CHECK_VALUES` | No | `0` | Set to `1` to count records per duplicate property pair — unlocks Tier 1/2 property fixes in the fix plan |
 
 ## Outputs
 
 | File | Description |
 |------|-------------|
-| `audit-data.json` | Raw schema data: all objects, properties, associations, and findings |
-| `audit-report.html` | Interactive HTML report with ERDs and filterable findings |
+| `audit-data.json` | Full raw data: objects, properties, pipelines, associations, limits, validations, findings, fix plan |
+| `audit-report.html` | Interactive HTML report — ERD diagrams, object inventory, limits dashboard, fix plan, filterable findings |
+| `fix-plan.json` | Machine-readable fix plan consumed by `fix.js` |
+| `fix-log.json` | Written by `fix.js` — log of every action taken |
+
+## Native Object Types Covered
+
+All 30+ native types are attempted. Objects not available in the portal or lacking API access are skipped gracefully.
+
+Appointments · Carts · Commerce Payments · Commerce Subscriptions · Communications · Companies · Contacts · Courses · Custom Objects · Deals · Discounts · Feedback Submissions · Fees · Goals · Invoices · Leads · Line Items · Listings · Orders · Partner Clients · Partner Services · Products · Projects · Quotes · Services · Taxes · Tickets · Users
+
+**Pipeline-enabled:** Appointments · Courses · Deals · Leads · Listings · Orders · Services · Tickets · Custom Objects (Enterprise)
 
 ## Skill Formats
 
-This skill is available in three formats:
-
-| File | Format | Usage |
-|------|--------|-------|
-| `skill.md` | Claude Code | Copy to `.claude/skills/crm-schema-audit.md` in your project |
-| `SKILL.md` | HubSpot Agent CLI | Compatible with `npx skills add` format |
-| `.claude-plugin/plugin.json` | Anthropic Plugin | `claude plugin install ./crm-schema-audit` |
+| File | Format |
+|------|--------|
+| `skill.md` | Claude Code — copy to `~/.claude/skills/` or `.claude/skills/` |
+| `formats/agent-cli.md` | HubSpot Agent CLI |
+| `.claude-plugin/plugin.json` | Anthropic Plugin |
 
 ## Troubleshooting
 
-**401 Unauthorized**: Regenerate your Private App token in HubSpot Settings.
-
-**403 Forbidden / missing properties**: Add missing scopes to your Private App:
-- `crm.schemas.read` — required for object schemas
-- `crm.objects.schemas.read` — required for property metadata
-
-**Empty properties for `calls`, `emails`, etc.**: These engagement objects may require additional scopes:
-- `crm.objects.calls.read`
-- `crm.objects.emails.read`
-
-**CLI not found message**: This is expected if HubSpot CLI is not installed. The script uses the REST API only — output is identical.
+| Error | Cause | Fix |
+|-------|-------|-----|
+| 401 Unauthorized | Token invalid or expired | Regenerate Private App token |
+| 403 Forbidden on object | Missing scope | Add the relevant `crm.objects.{type}.read` scope |
+| Object skipped (not found) | Object not available in this portal tier | Expected — audit continues |
+| 0 association types | Scope issue or wrong endpoint | Ensure read scopes cover both objects in the pair |
+| Limits endpoint null | Feature requires higher tier | Pro/Enterprise required for association labels, calculated properties |
+| fix.js 403 on archive | Missing write scope | Add `crm.schemas.{object}.write` to your token |

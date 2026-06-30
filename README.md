@@ -1,85 +1,103 @@
 # HubSpot Solutions AI Skills
 
-A library of reusable AI skills for HubSpot solutions teams, compatible with Claude Code, the HubSpot Agent CLI, and Anthropic Plugins.
+A library of reusable AI skills for HubSpot solutions teams. Skills work with Claude Code (CLI and Desktop), the HubSpot Agent CLI, and Anthropic Plugins.
 
-## What's Here
+## Skills
 
-Skills are organized by HubSpot domain:
-
-| Package | Domain | Skills |
-|---------|--------|--------|
-| [`packages/crm`](packages/crm) | CRM & Data Model | [CRM Schema Audit](packages/crm/skills/crm-schema-audit) |
-| `packages/marketing` | Marketing | _(coming soon)_ |
-| `packages/sales` | Sales | _(coming soon)_ |
-| `packages/cms` | CMS | _(coming soon)_ |
-| `packages/operations` | Operations | _(coming soon)_ |
+| Package | Skill | What It Does |
+|---------|-------|--------------|
+| [`packages/crm`](packages/crm) | [CRM Schema Audit](packages/crm/skills/crm-schema-audit) | Full CRM data model audit — 30+ object types, properties, pipelines, limits, fix plan |
+| `packages/marketing` | _(coming soon)_ | |
+| `packages/sales` | _(coming soon)_ | |
+| `packages/cms` | _(coming soon)_ | |
+| `packages/operations` | _(coming soon)_ | |
 
 All skills are indexed in [`skills-index.json`](skills-index.json).
 
-## Installation by Format
+---
 
-### Claude Code (recommended)
+## Installation
 
-Copy a skill's `skill.md` into your project's `.claude/skills/` directory:
+### Claude Desktop (global — works from any project)
 
 ```bash
-# Example: CRM Schema Audit
-cp packages/crm/skills/crm-schema-audit/skill.md /your-project/.claude/skills/crm-schema-audit.md
+# 1. Clone to a permanent location
+git clone https://github.com/robertainslie/hs-solutions-ai-skills ~/hubspot-skills
+
+# 2. Verify Node.js v18+
+node --version
+
+# 3. Install skills globally
+mkdir -p ~/.claude/skills
+ln -sf ~/hubspot-skills/packages/crm/skills/crm-schema-audit/skill.md \
+       ~/.claude/skills/crm-schema-audit.md
 ```
 
-Then invoke it in Claude Code:
+Restart Claude Desktop, then start a new conversation and ask:
+> "audit my HubSpot CRM schema"
+
+Keep up to date: `cd ~/hubspot-skills && git pull`
+
+---
+
+### Claude Code CLI (global)
+
+Same clone and symlink as above. Run from any directory — the report lands in your current working directory:
+
+```bash
+cd ~/Desktop          # or wherever you want the report
+export HUBSPOT_ACCESS_TOKEN=pat-na1-...
+claude
+```
+
+Then in Claude Code:
 ```
 /crm-schema-audit
 ```
 
-### HubSpot Agent CLI
+> **Don't run from inside `~/hubspot-skills/`** — output files would land in the repo. Run from a neutral directory.
 
-Each skill ships a `formats/agent-cli.md` compatible with the Agent CLI skills format.
-(Note: `SKILL.md` and `skill.md` collide on case-insensitive filesystems like macOS, so the Agent CLI variant lives in `formats/`.)
+---
 
-```bash
-# Reference the agent-cli.md alongside hubspot/agent-cli-skills
-npx skills add hubspot/agent-cli-skills
-# Then copy the Agent CLI variant into your skills directory:
-cp packages/crm/skills/crm-schema-audit/formats/agent-cli.md ~/.skills/crm-schema-audit.md
-```
+### Project-scoped install (Claude Code, within this repo)
 
-### Anthropic Plugin
+Skills in `.claude/skills/` are automatically available to Claude Code when working inside this repo — no extra steps needed.
 
-Each skill includes a `.claude-plugin/plugin.json` manifest and `commands/` directory:
-
-```bash
-# Point your plugin installer at a skill directory
-claude plugin install ./packages/crm/skills/crm-schema-audit
-```
+---
 
 ## Authentication
 
-Most skills require one or more of:
+Most skills require a HubSpot Private App token:
 
-| Method | Usage |
-|--------|-------|
-| `HUBSPOT_ACCESS_TOKEN` | Direct REST API access — generate a Private App token in HubSpot Settings > Integrations > Private Apps |
-| HubSpot CLI auth | `hubspot auth login` — required for CLI-based data collection |
-| HubSpot DevEx MCP | `hs mcp setup` — for IDE-integrated workflows |
+> **HubSpot Settings → Integrations → Private Apps → Create app**
 
-## Adding a New Skill
-
-Use the template in `templates/new-skill/`:
-
+Set it before running:
 ```bash
-cp -r templates/new-skill packages/<domain>/skills/<skill-name>
+export HUBSPOT_ACCESS_TOKEN=pat-na1-...
 ```
 
-Then update `skills-index.json` with the new skill's metadata.
+The audit script validates the token and auto-detects your portal ID via `GET /account-info/v3/details`.
 
-See the [template README](templates/new-skill/README.md) for the skill authoring guide.
+---
+
+## Skill Formats
+
+Each skill ships in three formats:
+
+| Format | File | How to use |
+|--------|------|------------|
+| Claude Code | `skill.md` | Copy or symlink to `~/.claude/skills/` |
+| HubSpot Agent CLI | `formats/agent-cli.md` | Copy to your Agent CLI skills directory |
+| Anthropic Plugin | `.claude-plugin/plugin.json` | `claude plugin install ./skill-directory` |
+
+---
 
 ## Repository Structure
 
 ```
 solutions-ai-skills/
-├── skills-index.json           # Machine-readable catalog of all skills
+├── .claude/skills/               # Project-scoped skills (auto-loaded by Claude Code)
+├── skills-index.json             # Machine-readable skill catalog
 ├── packages/
 │   ├── crm/
 │   │   └── skills/
@@ -89,9 +107,37 @@ solutions-ai-skills/
 │   │           │   └── agent-cli.md   # Agent CLI format
 │   │           ├── .claude-plugin/    # Plugin format
 │   │           ├── commands/          # Plugin slash commands
-│   │           ├── src/audit.js       # Implementation script
+│   │           ├── src/
+│   │           │   ├── audit.js       # Audit script
+│   │           │   └── fix.js         # Interactive fix script
 │   │           └── README.md
 │   └── ...
 └── templates/
-    └── new-skill/              # Scaffold for new skills
+    └── new-skill/                # Scaffold for authoring new skills
+```
+
+---
+
+## Adding a New Skill
+
+```bash
+cp -r templates/new-skill packages/<domain>/skills/<skill-name>
+```
+
+Fill in `skill.md`, `formats/agent-cli.md`, `.claude-plugin/plugin.json`, `src/`, and `README.md`. Then add an entry to `skills-index.json`.
+
+See the [template README](templates/new-skill/README.md) for the skill authoring guide.
+
+---
+
+## What's Gitignored
+
+```
+.env                          # Tokens and secrets
+.claude/settings.local.json   # Personal Claude Code permissions
+solutions-ai-skills-testing/  # Local test runs and output artifacts
+audit-data.json               # Generated by audit.js
+audit-report.html             # Generated by audit.js
+fix-plan.json                 # Generated by audit.js
+fix-log.json                  # Generated by fix.js
 ```

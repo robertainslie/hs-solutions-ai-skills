@@ -21,6 +21,7 @@ const TOKEN = process.env.HUBSPOT_ACCESS_TOKEN;
 let PORTAL_ID = process.env.HUBSPOT_PORTAL_ID || '';
 const OUTPUT_DIR = process.env.OUTPUT_DIR || process.cwd();
 const SKIP_UNUSED = process.env.SKIP_UNUSED === '1';
+const CHECK_VALUES = process.env.CHECK_VALUES === '1'; // opt-in: count records per property for fix plan
 
 // All native CRM object types.
 // name: API path segment used in /crm/v3/objects/{name} and /crm/v3/properties/{name}
@@ -92,6 +93,63 @@ function apiGet(apiPath) {
 function cliAvailable() {
   try { execSync('hubspot --version', { stdio: 'ignore' }); return true; }
   catch { return false; }
+}
+
+function apiPost(apiPath, body) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body);
+    const options = {
+      hostname: 'api.hubapi.com',
+      path: apiPath,
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${TOKEN}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      },
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          try { resolve(JSON.parse(data)); } catch { resolve({}); }
+        } else {
+          const err = new Error(`HTTP ${res.statusCode} from ${apiPath}: ${data.slice(0, 150)}`);
+          err.statusCode = res.statusCode;
+          reject(err);
+        }
+      });
+    });
+    req.on('error', reject);
+    req.write(payload);
+    req.end();
+  });
+}
+
+function apiDelete(apiPath) {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: 'api.hubapi.com',
+      path: apiPath,
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) resolve(true);
+        else {
+          const err = new Error(`HTTP ${res.statusCode} from ${apiPath}: ${data.slice(0, 150)}`);
+          err.statusCode = res.statusCode;
+          reject(err);
+        }
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
 }
 
 function runCli(args) {
@@ -259,6 +317,140 @@ async function getLimitsData() {
     catch { limits[key] = null; }
   }
   return limits;
+}
+
+// ─── Fix Plan ────────────────────────────────────────────────────────────────
+
+async function checkPropertyValueCount(objectName, propertyName) {
+  try {
+    const resp = await apiPost(`/crm/v3/objects/${objectName}/search`, {
+      filterGroups: [{ filters: [{ propertyName, operator: 'HAS_PROPERTY' }] }],
+      properties: ['hs_object_id'],
+      limit: 1,
+    });
+    return resp.total != null ? resp.total : null;
+  } catch { return null; }
+}
+
+async function getPipelineRecordCount(objectName, pipelineId) {
+  const prop = objectName === 'deals' ? 'pipeline' : 'hs_pipeline';
+  try {
+    const resp = await apiPost(`/crm/v3/objects/${objectName}/search`, {
+      filterGroups: [{ filters: [{ propertyName: prop, operator: 'EQ', value: pipelineId }] }],
+      properties: ['hs_object_id'],
+      limit: 1,
+    });
+    return resp.total != null ? resp.total : null;
+  } catch { return null; }
+}
+
+async function buildFixPlan(objects, findings, pipelines, pipelineRecordCounts) {
+  const fixes = [];
+  let seq = 0;
+  const nextId = () => `FIX-${String(++seq).padStart(3, '0')}`;
+
+  // --- Exact duplicate property pairs (critical findings) ---
+  for (const finding of findings.filter((f) => f.severity === 'critical')) {
+    const parts = (finding.propertyName || '').split(' / ');
+    if (parts.length !== 2) continue;
+    const [propA, propB] = parts;
+    const obj = objects.find((o) => o.name === finding.objectName);
+    if (!obj) continue;
+    const propADef = (obj.properties || []).find((p) => p.name === propA);
+    const propBDef = (obj.properties || []).find((p) => p.name === propB);
+
+    let countA = null, countB = null;
+    if (CHECK_VALUES) {
+      process.stdout.write(`  Checking values: ${obj.name}.${propA} / ${propB}...`);
+      [countA, countB] = await Promise.all([
+        checkPropertyValueCount(obj.name, propA),
+        checkPropertyValueCount(obj.name, propB),
+      ]);
+      console.log(` ${countA ?? '?'} / ${countB ?? '?'}`);
+    }
+
+    if (!CHECK_VALUES) {
+      fixes.push({
+        id: nextId(), tier: 3, type: 'review-duplicate', automatable: false,
+        objectName: obj.name, objectLabel: obj.label, objectTypeId: obj.objectTypeId,
+        propertyA: propA, propertyLabelA: propADef?.label || propA,
+        propertyB: propB, propertyLabelB: propBDef?.label || propB,
+        reason: `Exact duplicate label — re-run with CHECK_VALUES=1 to check value counts and unlock auto-fix.`,
+      });
+    } else if ((countA || 0) === 0 && (countB || 0) === 0) {
+      const toArchive = propADef?.hubspotDefined ? propB : propA;
+      const toKeep = toArchive === propA ? propB : propA;
+      fixes.push({
+        id: nextId(), tier: 1, type: 'archive-empty-duplicate', automatable: true,
+        objectName: obj.name, objectLabel: obj.label, objectTypeId: obj.objectTypeId,
+        propertyToArchive: toArchive,
+        propertyToArchiveLabel: (toArchive === propA ? propADef : propBDef)?.label || toArchive,
+        canonicalProperty: toKeep,
+        canonicalPropertyLabel: (toKeep === propA ? propADef : propBDef)?.label || toKeep,
+        sourceValueCount: 0, canonicalValueCount: 0,
+        reason: `Both properties have 0 records with values. Archive "${toArchive}" — no data migration needed.`,
+      });
+    } else if ((countA || 0) === 0 || (countB || 0) === 0) {
+      const emptyIsA = (countA || 0) === 0;
+      const toArchive = emptyIsA ? propA : propB;
+      const toKeep = emptyIsA ? propB : propA;
+      const keepCount = emptyIsA ? countB : countA;
+      fixes.push({
+        id: nextId(), tier: 1, type: 'archive-empty-duplicate', automatable: true,
+        objectName: obj.name, objectLabel: obj.label, objectTypeId: obj.objectTypeId,
+        propertyToArchive: toArchive,
+        propertyToArchiveLabel: (emptyIsA ? propADef : propBDef)?.label || toArchive,
+        canonicalProperty: toKeep,
+        canonicalPropertyLabel: (emptyIsA ? propBDef : propADef)?.label || toKeep,
+        sourceValueCount: 0, canonicalValueCount: keepCount,
+        reason: `"${toArchive}" has 0 records with values. Archive it — "${toKeep}" is canonical with ${(keepCount || 0).toLocaleString()} records.`,
+      });
+    } else {
+      // Both have values — migration required, suggest the higher-count one as canonical
+      const aWins = (countA || 0) >= (countB || 0);
+      const canonical = aWins ? propA : propB;
+      const source = aWins ? propB : propA;
+      const canonicalDef = aWins ? propADef : propBDef;
+      const sourceDef = aWins ? propBDef : propADef;
+      const sourceCount = aWins ? countB : countA;
+      const canonicalCount = aWins ? countA : countB;
+      fixes.push({
+        id: nextId(), tier: 2, type: 'migrate-and-archive', automatable: true, requiresConfirmation: true,
+        objectName: obj.name, objectLabel: obj.label, objectTypeId: obj.objectTypeId,
+        sourceProperty: source, sourcePropertyLabel: sourceDef?.label || source, sourceValueCount: sourceCount,
+        canonicalProperty: canonical, canonicalPropertyLabel: canonicalDef?.label || canonical, canonicalValueCount: canonicalCount,
+        reason: `Both have values. Suggested canonical: "${canonical}" (${(canonicalCount || 0).toLocaleString()} records). Migrate ${(sourceCount || 0).toLocaleString()} records from "${source}", then archive it. Confirm before executing.`,
+      });
+    }
+  }
+
+  // --- Pipelines ---
+  for (const [objName, psList] of Object.entries(pipelines)) {
+    const obj = objects.find((o) => o.name === objName);
+    for (const pipeline of psList) {
+      const recordCount = pipelineRecordCounts[`${objName}:${pipeline.id}`];
+      if (recordCount === 0) {
+        fixes.push({
+          id: nextId(), tier: 1, type: 'archive-pipeline', automatable: true,
+          objectName: objName, objectLabel: obj?.label || objName,
+          pipelineId: pipeline.id, pipelineName: pipeline.label,
+          stageCount: pipeline.stages.length, recordCount: 0,
+          reason: `"${pipeline.label}" has 0 records across all ${pipeline.stages.length} stages — safe to archive.`,
+        });
+      } else if (recordCount != null && recordCount > 0) {
+        fixes.push({
+          id: nextId(), tier: 2, type: 'archive-pipeline-with-records', automatable: false,
+          objectName: objName, objectLabel: obj?.label || objName,
+          pipelineId: pipeline.id, pipelineName: pipeline.label,
+          stageCount: pipeline.stages.length, recordCount,
+          reason: `"${pipeline.label}" has ${recordCount.toLocaleString()} records. Move all records to another pipeline first, then archive.`,
+        });
+      }
+    }
+  }
+
+  fixes.sort((a, b) => a.tier - b.tier || a.type.localeCompare(b.type) || a.objectName.localeCompare(b.objectName));
+  return fixes;
 }
 
 // ─── Analysis ────────────────────────────────────────────────────────────────
@@ -468,7 +660,7 @@ function limitBar(percentage) {
 }
 
 function generateHtml(data, findings) {
-  const { objects, associations, pipelines, limits, validations } = data;
+  const { objects, associations, pipelines, limits, validations, fixPlan } = data;
   const criticalCount = findings.filter((f) => f.severity === 'critical').length;
   const warningCount = findings.filter((f) => f.severity === 'warning').length;
   const infoCount = findings.filter((f) => f.severity === 'info').length;
@@ -811,6 +1003,37 @@ function generateHtml(data, findings) {
       <div id="erd-deals" class="erd-panel"><pre class="mermaid">${erdDeals}</pre></div>
     </section>
 
+    ${fixPlan && fixPlan.length > 0 ? (() => {
+  const t1 = fixPlan.filter((f) => f.tier === 1);
+  const t2 = fixPlan.filter((f) => f.tier === 2);
+  const t3 = fixPlan.filter((f) => f.tier === 3);
+  const typeLabel = { 'archive-empty-duplicate': 'Archive property', 'migrate-and-archive': 'Migrate → archive', 'archive-pipeline': 'Archive pipeline', 'archive-pipeline-with-records': 'Archive pipeline (has records)', 'review-duplicate': 'Review duplicate' };
+  const fixRow = (f) => {
+    const tierBadge = f.tier === 1 ? '<span class="badge badge-active">Tier 1</span>' : f.tier === 2 ? '<span class="badge badge-warning">Tier 2</span>' : '<span class="badge badge-skip">Tier 3</span>';
+    const auto = f.automatable ? '<span style="color:#27ae60">✓ auto</span>' : '<span style="color:#999">manual</span>';
+    const obj = `<code>${f.objectName}</code>`;
+    return `<tr><td class="shrink">${tierBadge}</td><td class="shrink">${typeLabel[f.type] || f.type}</td><td class="shrink">${obj}</td><td class="grow">${f.reason}</td><td class="shrink">${auto}</td></tr>`;
+  };
+  return `<section>
+      <h2>Fix Plan (${fixPlan.length} items)</h2>
+      <p style="font-size:.875rem;color:#555;margin-bottom:1rem">
+        Run <code>node fix.js --dry-run</code> to preview all fixes, then <code>node fix.js --execute</code> to apply interactively.
+        ${data.checkValuesRun ? '' : ' Re-run audit with <code>CHECK_VALUES=1</code> to unlock Tier 1/2 property fixes.'}
+      </p>
+      <div style="display:flex;gap:1rem;margin-bottom:1rem;flex-wrap:wrap">
+        <div class="stat-card active" style="flex:1;min-width:160px"><div class="number">${t1.length}</div><div class="label">Tier 1 — Auto-fixable</div></div>
+        <div class="stat-card warning" style="flex:1;min-width:160px"><div class="number">${t2.length}</div><div class="label">Tier 2 — Needs confirmation</div></div>
+        <div class="stat-card" style="flex:1;min-width:160px"><div class="number">${t3.length}</div><div class="label">Tier 3 — Manual review</div></div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th class="shrink">Tier</th><th class="shrink">Action</th><th class="shrink">Object</th><th>Detail</th><th class="shrink">Automation</th></tr></thead>
+          <tbody>${fixPlan.map(fixRow).join('')}</tbody>
+        </table>
+      </div>
+    </section>`;
+})() : ''}
+
     <section>
       <h2>Audit Findings (${findings.length} total)</h2>
       <div class="filter-bar">
@@ -947,6 +1170,17 @@ async function main() {
     }
   }
 
+  // 3b. Pipeline record counts (always — needed for fix plan)
+  console.log('  Checking record counts per pipeline...');
+  const pipelineRecordCounts = {};
+  for (const [objName, psList] of Object.entries(pipelines)) {
+    for (const pipeline of psList) {
+      const count = await getPipelineRecordCount(objName, pipeline.id);
+      pipelineRecordCounts[`${objName}:${pipeline.id}`] = count;
+      if (count === 0) console.log(`    ${objName} / "${pipeline.label}" — empty`);
+    }
+  }
+
   // 4. Association types — build pairs dynamically from accessible objects
   console.log('\n[4/6] Collecting association types...');
   const associations = [];
@@ -990,34 +1224,55 @@ async function main() {
   if (validations.length > 0) console.log(`  Found ${validations.length} property validation rule(s)`);
 
   // 6. Analysis
-  console.log('\n[6/6] Running property analysis...');
+  console.log('\n[6/7] Running property analysis...');
   const findings = analyzeProperties(objects);
   const critical = findings.filter((f) => f.severity === 'critical').length;
   const warnings = findings.filter((f) => f.severity === 'warning').length;
   const info = findings.filter((f) => f.severity === 'info').length;
   console.log(`  ${findings.length} findings: ${critical} critical, ${warnings} warnings, ${info} info`);
 
+  // 7. Fix plan
+  console.log(`\n[7/7] Building fix plan${CHECK_VALUES ? ' (CHECK_VALUES=1: checking property value counts)' : ''}...`);
+  const fixPlan = await buildFixPlan(objects, findings, pipelines, pipelineRecordCounts);
+  const fp1 = fixPlan.filter((f) => f.tier === 1).length;
+  const fp2 = fixPlan.filter((f) => f.tier === 2).length;
+  const fp3 = fixPlan.filter((f) => f.tier === 3).length;
+  console.log(`  ${fixPlan.length} fixes: ${fp1} auto-fixable, ${fp2} need confirmation, ${fp3} manual`);
+  if (!CHECK_VALUES && critical > 0) {
+    console.log(`  Tip: re-run with CHECK_VALUES=1 to unlock Tier 1/2 auto-fix for ${critical} duplicate property pair(s)`);
+  }
+
   // Output
   const auditData = {
     generatedAt: new Date().toISOString(),
     portalId: PORTAL_ID || null,
+    checkValuesRun: CHECK_VALUES,
     objects,
     pipelines,
     associations,
     limits,
     validations,
     findings,
+    fixPlan,
   };
 
   const dataPath = path.join(OUTPUT_DIR, 'audit-data.json');
   const reportPath = path.join(OUTPUT_DIR, 'audit-report.html');
+  const fixPlanPath = path.join(OUTPUT_DIR, 'fix-plan.json');
 
   fs.writeFileSync(dataPath, JSON.stringify(auditData, null, 2));
   fs.writeFileSync(reportPath, generateHtml(auditData, findings));
+  fs.writeFileSync(fixPlanPath, JSON.stringify({
+    generatedAt: auditData.generatedAt,
+    portalId: auditData.portalId,
+    checkValuesRun: CHECK_VALUES,
+    fixes: fixPlan,
+  }, null, 2));
 
   console.log('\nDone!');
-  console.log(`  Data:   ${dataPath}`);
-  console.log(`  Report: ${reportPath}`);
+  console.log(`  Data:      ${dataPath}`);
+  console.log(`  Report:    ${reportPath}`);
+  console.log(`  Fix plan:  ${fixPlanPath}`);
   console.log('\nOpen audit-report.html in your browser to view the full report.');
 }
 

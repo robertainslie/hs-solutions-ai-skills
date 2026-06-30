@@ -1,0 +1,22 @@
+{
+  "name": "solutions-ai-skills",
+  "version": "0.1.0",
+  "description": "A library of reusable AI skills for HubSpot solutions teams",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "audit": "node packages/crm/skills/crm-schema-audit/src/audit.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "keywords": [
+    "hubspot",
+    "ai-skills",
+    "claude",
+    "crm"
+  ],
+  "license": "MIT"
+}

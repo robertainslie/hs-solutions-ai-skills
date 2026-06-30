@@ -1,0 +1,28 @@
+{
+  "$schema": "./skills-index.schema.json",
+  "version": "1",
+  "skills": [
+    {
+      "id": "crm-schema-audit",
+      "domain": "crm",
+      "name": "CRM Schema Audit",
+      "description": "Builds a complete picture of the HubSpot CRM: audits all 30+ native object types plus custom objects, checks which are in use via record sampling, collects properties (with unique-identifier and fieldType metadata), fetches pipelines for all pipeline-enabled objects, pulls CRM limits (records, properties, pipelines, custom objects, association labels), and fetches property validation rules. Generates an HTML report with ERD diagrams, object usage status, pipeline breakdown, limits dashboard, and a filterable findings table.",
+      "formats": ["claude-code", "agent-cli", "plugin"],
+      "auth": ["HUBSPOT_ACCESS_TOKEN", "hubspot-cli-optional"],
+      "path": "packages/crm/skills/crm-schema-audit",
+      "tags": ["crm", "schema", "data-model", "audit", "erd", "properties", "data-quality", "pipelines", "limits", "unique-identifiers", "property-validations"],
+      "triggers": [
+        "audit CRM schema",
+        "find duplicate properties",
+        "CRM data model ERD",
+        "HubSpot schema review",
+        "property naming issues",
+        "check CRM limits",
+        "review pipelines",
+        "which objects are in use",
+        "property validation rules",
+        "unique identifier properties"
+      ]
+    }
+  ]
+}

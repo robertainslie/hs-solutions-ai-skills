@@ -2,4 +2,7 @@
 solutions-ai-skills-testing/
 audit-data.json
 audit-report.html
+fix-plan.json
+fix-log.json
 node_modules/
+.claude/settings.local.json

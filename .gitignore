@@ -1,0 +1,5 @@
+.env
+solutions-ai-skills-testing/
+audit-data.json
+audit-report.html
+node_modules/

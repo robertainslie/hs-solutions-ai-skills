@@ -56,22 +56,6 @@ const NATIVE_OBJECTS = [
   { name: 'projects',            objectTypeId: '0-970', label: 'Projects',               hasPipelines: false },
 ];
 
-// Key association pairs to document
-const ASSOCIATION_PAIRS = [
-  ['contacts', 'companies'],
-  ['contacts', 'deals'],
-  ['contacts', 'tickets'],
-  ['contacts', 'leads'],
-  ['contacts', 'quotes'],
-  ['contacts', 'invoices'],
-  ['companies', 'deals'],
-  ['companies', 'tickets'],
-  ['companies', 'invoices'],
-  ['deals', 'tickets'],
-  ['deals', 'line_items'],
-  ['deals', 'quotes'],
-  ['deals', 'invoices'],
-];
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
 
@@ -237,11 +221,11 @@ async function getPipelinesForObject(objectName) {
 
 async function getAssociationTypes(fromType, toType) {
   try {
-    const resp = await apiGet(`/crm/v4/associations/${fromType}/${toType}/types`);
+    const resp = await apiGet(`/crm/v4/associations/${fromType}/${toType}/labels`);
     return (resp.results || []).map((t) => ({
       fromType, toType,
       typeId: t.typeId,
-      label: t.label || `${fromType} → ${toType}`,
+      label: t.label || (t.category === 'HUBSPOT_DEFINED' ? `${fromType} → ${toType}` : `Custom (${t.typeId})`),
       category: t.category,
     }));
   } catch {
@@ -435,7 +419,9 @@ function analyzeProperties(allObjects) {
 // ─── ERD Generation ──────────────────────────────────────────────────────────
 
 function sanitizeName(name) {
-  return name.toUpperCase().replace(/[^A-Z0-9_]/g, '_');
+  const upper = name.toUpperCase().replace(/[^A-Z0-9_]/g, '_');
+  // Mermaid entity names must start with a letter
+  return /^[A-Z]/.test(upper) ? upper : 'OBJ_' + upper;
 }
 
 function buildMermaidERD(objects, associations, filter) {
@@ -516,17 +502,17 @@ function generateHtml(data, findings) {
     else if (usage.inUse) usageBadge = '<span class="badge badge-active">In Use</span>';
     else if (usage.accessible === false) usageBadge = '<span class="badge badge-skip">Skipped</span>';
     else usageBadge = '<span class="badge badge-empty">Empty</span>';
-    const pipelinePart = pipelineCount > 0 ? `<span style="color:#2980b9">${pipelineCount} pipeline${pipelineCount !== 1 ? 's' : ''}</span>` : '—';
-    const uniquePart = uniqueIdCount > 0 ? `<span style="color:#8e44ad">${uniqueIdCount} unique ID${uniqueIdCount !== 1 ? 's' : ''}</span>` : '—';
+    const pipelinePart = pipelineCount > 0 ? `<span style="color:#2980b9;white-space:nowrap">${pipelineCount} pipeline${pipelineCount !== 1 ? 's' : ''}</span>` : '—';
+    const uniquePart = uniqueIdCount > 0 ? `<span style="color:#8e44ad;white-space:nowrap">${uniqueIdCount} unique ID${uniqueIdCount !== 1 ? 's' : ''}</span>` : '—';
     return `<tr>
       <td><strong>${o.label || o.name}</strong></td>
-      <td><code>${o.name}</code></td>
-      <td>${isCustom ? '<span class="badge badge-info">Custom</span>' : '<span class="badge badge-native">Native</span>'}</td>
-      <td>${usageBadge}</td>
-      <td>${props.length}</td>
-      <td>${customPropCount}</td>
-      <td>${uniquePart}</td>
-      <td>${pipelinePart}</td>
+      <td class="shrink"><code>${o.name}</code></td>
+      <td class="shrink">${isCustom ? '<span class="badge badge-info">Custom</span>' : '<span class="badge badge-native">Native</span>'}</td>
+      <td class="shrink">${usageBadge}</td>
+      <td class="num">${props.length}</td>
+      <td class="num">${customPropCount}</td>
+      <td class="shrink">${uniquePart}</td>
+      <td class="shrink">${pipelinePart}</td>
     </tr>`;
   }).join('');
 
@@ -562,10 +548,10 @@ function generateHtml(data, findings) {
       const color = p >= 90 ? 'color:var(--critical)' : p >= 70 ? 'color:var(--warning)' : '';
       return `<tr>
         <td>${labelFn(item)}</td>
-        <td>${item.limit != null ? item.limit.toLocaleString() : '—'}</td>
-        <td>${item.usage != null ? item.usage.toLocaleString() : '—'}</td>
-        <td style="${color}">${pct(item.percentage)}</td>
-        <td>${limitBar(item.percentage)}</td>
+        <td class="num">${item.limit != null ? item.limit.toLocaleString() : '—'}</td>
+        <td class="num">${item.usage != null ? item.usage.toLocaleString() : '—'}</td>
+        <td class="num" style="${color}">${pct(item.percentage)}</td>
+        <td class="bar-cell">${limitBar(item.percentage)}</td>
       </tr>`;
     }).join('');
   }
@@ -607,11 +593,11 @@ function generateHtml(data, findings) {
       info: '<span class="badge badge-info">Info</span>',
     }[f.severity];
     return `<tr data-severity="${f.severity}" data-object="${f.objectName}">
-      <td>${badge}</td>
-      <td><code>${f.objectName}</code></td>
-      <td><code>${f.propertyName}</code></td>
-      <td>${f.issue}</td>
-      <td>${f.recommendation}</td>
+      <td class="shrink">${badge}</td>
+      <td class="shrink"><code>${f.objectName}</code></td>
+      <td class="shrink"><code>${f.propertyName}</code></td>
+      <td class="shrink">${f.issue}</td>
+      <td class="grow">${f.recommendation}</td>
     </tr>`;
   }).join('');
 
@@ -666,14 +652,20 @@ function generateHtml(data, findings) {
     .filter-bar{display:flex;gap:.75rem;margin-bottom:1rem;flex-wrap:wrap;align-items:center}
     .filter-bar label{font-size:.85rem;font-weight:500}
     .filter-bar select{padding:.3rem .6rem;border:1px solid #ddd;border-radius:4px;font-size:.85rem}
-    table{width:100%;border-collapse:collapse;font-size:.875rem}
-    th{background:var(--hs-gray);padding:.6rem .8rem;text-align:left;font-weight:600;border-bottom:2px solid #e8e8e8}
-    td{padding:.6rem .8rem;border-bottom:1px solid #f0f0f0;vertical-align:top}
+    .table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+    table{width:100%;border-collapse:collapse;font-size:.875rem;table-layout:auto}
+    th{background:var(--hs-gray);padding:.5rem .75rem;text-align:left;font-weight:600;border-bottom:2px solid #e8e8e8;white-space:nowrap}
+    td{padding:.5rem .75rem;border-bottom:1px solid #f0f0f0;vertical-align:top}
+    td.shrink{width:1%;white-space:nowrap}
+    td.num{width:1%;white-space:nowrap;text-align:right;font-variant-numeric:tabular-nums}
+    td.grow{word-break:break-word;min-width:180px}
+    th.shrink{width:1%}
+    th.num{width:1%;text-align:right}
     tr:hover td{background:#fafbfc}
     tr[data-severity="critical"] td:first-child{border-left:3px solid var(--critical)}
     tr[data-severity="warning"] td:first-child{border-left:3px solid var(--warning)}
     tr[data-severity="info"] td:first-child{border-left:3px solid var(--info)}
-    .badge{display:inline-block;padding:.2rem .5rem;border-radius:4px;font-size:.75rem;font-weight:600}
+    .badge{display:inline-block;padding:.2rem .5rem;border-radius:4px;font-size:.75rem;font-weight:600;white-space:nowrap}
     .badge-critical{background:#fdecea;color:var(--critical)}
     .badge-warning{background:#fef3e8;color:var(--warning)}
     .badge-info{background:#e8f4fb;color:var(--info)}
@@ -681,14 +673,16 @@ function generateHtml(data, findings) {
     .badge-active{background:#e8f8ed;color:#27ae60}
     .badge-empty{background:#fafafa;color:#999;border:1px solid #eee}
     .badge-skip{background:#fff3cd;color:#856404}
-    code{font-family:'SF Mono',Consolas,monospace;font-size:.8rem;background:#f4f4f4;padding:.1rem .3rem;border-radius:3px}
+    code{font-family:'SF Mono',Consolas,monospace;font-size:.8rem;background:#f4f4f4;padding:.1rem .3rem;border-radius:3px;white-space:nowrap}
     ol{padding-left:1.25rem}
     ol li{margin-bottom:.5rem;line-height:1.5}
     a{color:var(--hs-blue)}
     .empty{color:#999;font-style:italic;text-align:center;padding:2rem}
-    .limits-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:1.5rem;margin-bottom:1rem}
-    .limits-card{border:1px solid #e8e8e8;border-radius:6px;padding:1rem}
+    .limits-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:1.5rem;margin-bottom:1rem}
+    .limits-card{border:1px solid #e8e8e8;border-radius:6px;padding:1rem;min-width:0}
     .limits-card h4{font-size:.9rem;margin-bottom:.75rem;color:#555}
+    .limits-card table{width:100%}
+    .bar-cell{width:140px;white-space:nowrap}
     details summary{cursor:pointer}
     details summary::-webkit-details-marker{color:var(--hs-blue)}
   </style>
@@ -747,12 +741,14 @@ function generateHtml(data, findings) {
 
     <section>
       <h2>Object Inventory</h2>
-      <table>
-        <thead>
-          <tr><th>Object</th><th>Internal Name</th><th>Type</th><th>Usage</th><th>Total Props</th><th>Custom Props</th><th>Unique IDs</th><th>Pipelines</th></tr>
-        </thead>
-        <tbody>${objectRows || '<tr><td colspan="8" class="empty">No objects found</td></tr>'}</tbody>
-      </table>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Object</th><th class="shrink">Internal Name</th><th class="shrink">Type</th><th class="shrink">Usage</th><th class="num">Total Props</th><th class="num">Custom Props</th><th class="shrink">Unique IDs</th><th class="shrink">Pipelines</th></tr>
+          </thead>
+          <tbody>${objectRows || '<tr><td colspan="8" class="empty">No objects found</td></tr>'}</tbody>
+        </table>
+      </div>
     </section>
 
     ${pipelineEntries ? `
@@ -770,21 +766,21 @@ function generateHtml(data, findings) {
         <div class="limits-card">
           <h4>Record Limits</h4>
           <table>
-            <thead><tr><th>Object</th><th>Limit</th><th>Used</th><th>%</th><th></th></tr></thead>
+            <thead><tr><th>Object</th><th class="num">Limit</th><th class="num">Used</th><th class="num">%</th><th class="bar-cell"></th></tr></thead>
             <tbody>${recordRows}</tbody>
           </table>
         </div>
         <div class="limits-card">
           <h4>Custom Property Limits (per object)</h4>
           <table>
-            <thead><tr><th>Object</th><th>Limit</th><th>Used</th><th>%</th><th></th></tr></thead>
+            <thead><tr><th>Object</th><th class="num">Limit</th><th class="num">Used</th><th class="num">%</th><th class="bar-cell"></th></tr></thead>
             <tbody>${propRows}</tbody>
           </table>
         </div>
         <div class="limits-card">
           <h4>Pipeline Limits</h4>
           <table>
-            <thead><tr><th>Object</th><th>Limit</th><th>Used</th><th>%</th><th></th></tr></thead>
+            <thead><tr><th>Object</th><th class="num">Limit</th><th class="num">Used</th><th class="num">%</th><th class="bar-cell"></th></tr></thead>
             <tbody>${pipelineLimitRows}</tbody>
           </table>
         </div>
@@ -795,10 +791,12 @@ function generateHtml(data, findings) {
     <section>
       <h2>Property Validations (${validations.length} rules)</h2>
       <p style="font-size:.85rem;color:#555;margin-bottom:1rem">Properties with active validation rules that constrain how values can be entered.</p>
-      <table>
-        <thead><tr><th>Object Type ID</th><th>Property</th><th>Rule Type</th><th>Blocks Create</th><th>Blocks Update</th></tr></thead>
-        <tbody>${validationRows}</tbody>
-      </table>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th class="shrink">Object Type ID</th><th class="shrink">Property</th><th class="shrink">Rule Type</th><th class="shrink">Blocks Create</th><th class="shrink">Blocks Update</th></tr></thead>
+          <tbody>${validationRows}</tbody>
+        </table>
+      </div>
     </section>` : ''}
 
     <section>
@@ -829,10 +827,12 @@ function generateHtml(data, findings) {
           ${objects.map((o) => `<option value="${o.name}">${o.label || o.name}</option>`).join('')}
         </select>
       </div>
-      <table id="findings-table">
-        <thead><tr><th>Severity</th><th>Object</th><th>Property</th><th>Issue</th><th>Recommendation</th></tr></thead>
-        <tbody>${findingsRows || '<tr><td colspan="5" class="empty">No issues found — your schema looks clean!</td></tr>'}</tbody>
-      </table>
+      <div class="table-wrap">
+        <table id="findings-table">
+          <thead><tr><th class="shrink">Severity</th><th class="shrink">Object</th><th class="shrink">Property</th><th class="shrink">Issue</th><th>Recommendation</th></tr></thead>
+          <tbody>${findingsRows || '<tr><td colspan="5" class="empty">No issues found — your schema looks clean!</td></tr>'}</tbody>
+        </table>
+      </div>
     </section>
 
     <section>
@@ -947,19 +947,30 @@ async function main() {
     }
   }
 
-  // 4. Association types
+  // 4. Association types — build pairs dynamically from accessible objects
   console.log('\n[4/6] Collecting association types...');
   const associations = [];
-  for (const [from, to] of ASSOCIATION_PAIRS) {
-    const types = await getAssociationTypes(from, to);
-    associations.push(...types);
-  }
-  // Custom object associations
-  for (const customObj of customNativeEntries) {
-    for (const nativeName of ['contacts', 'companies', 'deals', 'tickets']) {
-      const types = await getAssociationTypes(customObj.name, nativeName);
-      associations.push(...types);
+  // Use accessible objects (in-use or accessible-but-empty); prefer API name over numeric ID
+  const assocCandidates = objects
+    .filter((o) => o.usage.accessible !== false)
+    .map((o) => o.name);
+
+  // Build unique pairs (avoid duplicates and self-pairs)
+  const seenPairs = new Set();
+  const dynamicPairs = [];
+  for (let i = 0; i < assocCandidates.length; i++) {
+    for (let j = i + 1; j < assocCandidates.length; j++) {
+      const key = [assocCandidates[i], assocCandidates[j]].sort().join('|');
+      if (!seenPairs.has(key)) {
+        seenPairs.add(key);
+        dynamicPairs.push([assocCandidates[i], assocCandidates[j]]);
+      }
     }
+  }
+  console.log(`  Checking ${dynamicPairs.length} object pairs...`);
+  for (const [from, to] of dynamicPairs) {
+    const types = await getAssociationTypes(from, to);
+    if (types.length > 0) associations.push(...types);
   }
   console.log(`  Found ${associations.length} association type(s)`);
 

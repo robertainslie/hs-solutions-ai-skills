@@ -22,6 +22,7 @@ let PORTAL_ID = process.env.HUBSPOT_PORTAL_ID || '';
 const OUTPUT_DIR = process.env.OUTPUT_DIR || process.cwd();
 const SKIP_UNUSED = process.env.SKIP_UNUSED === '1';
 const CHECK_VALUES = process.env.CHECK_VALUES === '1'; // opt-in: count records per property for fix plan
+const AUDIT_WORKFLOWS = process.env.AUDIT_WORKFLOWS !== '0'; // on by default; set to 0 to skip
 
 // All native CRM object types.
 // name: API path segment used in /crm/v3/objects/{name} and /crm/v3/properties/{name}
@@ -317,6 +318,156 @@ async function getLimitsData() {
     catch { limits[key] = null; }
   }
   return limits;
+}
+
+// ─── Workflows ───────────────────────────────────────────────────────────────
+
+const ACTION_TYPE_LABELS = {
+  '0-1': 'Delay (time)', '0-2': 'Go to action', '0-3': 'Create task',
+  '0-4': 'Send email', '0-5': 'Set property', '0-14': 'Create record',
+  '0-18': 'Rotate leads', '0-19': 'Send internal notification',
+  '0-20': 'Salesforce campaign', '0-23': 'Format data',
+  '0-28': 'Send SMS / communication', '0-33': 'Enrollment action',
+  '0-35': 'Delay (until date)', '0-63809083': 'Add to list',
+  'LIST_BRANCH': 'Branch (list)', 'STATIC_BRANCH': 'Branch (static)',
+  'WEBHOOK': 'Webhook', 'CUSTOM_CODE': 'Custom code',
+};
+
+const JUNK_NAME_PATTERN = /^(test\s*\d*|new workflow|unnamed.*|asdf.*|jlk.*|adsf.*|untitled.*|draft.*|copy of.*|wip\s*\d*|temp\s*\d*)$/i;
+
+async function getWorkflows() {
+  const summaries = [];
+  let after;
+  try {
+    do {
+      const resp = await apiGet(`/automation/v4/flows?limit=50${after ? `&after=${after}` : ''}`);
+      summaries.push(...(resp.results || []));
+      after = resp.paging?.next?.after;
+    } while (after);
+  } catch (e) {
+    if (e.statusCode === 403) { console.warn('  No access to workflows (add automation scope)'); return []; }
+    console.warn(`  Warning: could not fetch workflows (${e.message})`);
+    return [];
+  }
+
+  // Fetch full detail for each (needed for actions, enrollmentCriteria)
+  const details = [];
+  for (const s of summaries) {
+    try {
+      details.push(await apiGet(`/automation/v4/flows/${s.id}`));
+    } catch { details.push(s); } // fall back to summary
+  }
+  return details;
+}
+
+function analyzeWorkflows(workflows) {
+  const findings = [];
+  const now = new Date();
+  const ninetyDaysAgo = new Date(now - 90 * 24 * 60 * 60 * 1000);
+
+  for (const wf of workflows) {
+    const name = wf.name || '';
+    const enabled = wf.isEnabled;
+    const actions = wf.actions || [];
+    const enrollment = wf.enrollmentCriteria || {};
+    const updatedAt = wf.updatedAt ? new Date(wf.updatedAt) : null;
+    const createdAt = wf.createdAt ? new Date(wf.createdAt) : null;
+    const neverEdited = createdAt && updatedAt && Math.abs(updatedAt - createdAt) < 5000;
+
+    // 0-action workflows — broken/incomplete
+    if (actions.length === 0) {
+      findings.push({
+        severity: 'critical', workflowId: wf.id, workflowName: name,
+        objectTypeId: wf.objectTypeId, isEnabled: enabled,
+        issue: 'No actions configured',
+        recommendation: enabled ? `"${name}" is enabled but has no actions — it enrolls records and does nothing. Disable or delete it.` : `"${name}" has no actions — likely an abandoned draft. Delete it.`,
+      });
+    }
+
+    // Junk/test names
+    if (JUNK_NAME_PATTERN.test(name.trim())) {
+      findings.push({
+        severity: 'critical', workflowId: wf.id, workflowName: name,
+        objectTypeId: wf.objectTypeId, isEnabled: enabled,
+        issue: 'Test or placeholder name',
+        recommendation: `"${name}" appears to be a test or draft workflow. ${enabled ? 'Disable and delete it.' : 'Delete it.'}`,
+      });
+    }
+
+    // Never-edited and disabled
+    if (!enabled && neverEdited) {
+      findings.push({
+        severity: 'warning', workflowId: wf.id, workflowName: name,
+        objectTypeId: wf.objectTypeId, isEnabled: enabled,
+        issue: 'Disabled, never edited (likely abandoned draft)',
+        recommendation: `"${name}" was created but never modified. Delete if not needed.`,
+      });
+    }
+
+    // Manual-enrollment — only fires if someone manually enrolls; may be intentional but worth flagging
+    if (enrollment.type === 'MANUAL' && !enabled) {
+      findings.push({
+        severity: 'info', workflowId: wf.id, workflowName: name,
+        objectTypeId: wf.objectTypeId, isEnabled: enabled,
+        issue: 'Manual enrollment, disabled',
+        recommendation: `"${name}" requires manual enrollment to trigger and is disabled. Confirm it's still needed.`,
+      });
+    }
+
+    // Re-enrollment enabled on active workflows — can cause repeated sends
+    if (enabled && enrollment.shouldReEnroll) {
+      const hasEmail = actions.some((a) => a.actionTypeId === '0-4');
+      if (hasEmail) {
+        findings.push({
+          severity: 'warning', workflowId: wf.id, workflowName: name,
+          objectTypeId: wf.objectTypeId, isEnabled: enabled,
+          issue: 'Re-enrollment enabled on email-sending workflow',
+          recommendation: `"${name}" can re-enroll contacts and sends email — verify this is intentional to avoid duplicate sends.`,
+        });
+      }
+    }
+
+    // Webhook actions — external dependency, should be documented
+    const hasWebhook = actions.some((a) => a.type === 'WEBHOOK');
+    if (hasWebhook && enabled) {
+      findings.push({
+        severity: 'info', workflowId: wf.id, workflowName: name,
+        objectTypeId: wf.objectTypeId, isEnabled: enabled,
+        issue: 'Webhook action in active workflow',
+        recommendation: `"${name}" calls an external webhook. Ensure the endpoint is monitored and documented.`,
+      });
+    }
+
+    // Custom code — maintenance risk
+    const hasCustomCode = actions.some((a) => a.type === 'CUSTOM_CODE');
+    if (hasCustomCode && enabled) {
+      findings.push({
+        severity: 'info', workflowId: wf.id, workflowName: name,
+        objectTypeId: wf.objectTypeId, isEnabled: enabled,
+        issue: 'Custom code action in active workflow',
+        recommendation: `"${name}" uses custom code. Ensure it is version-controlled and tested.`,
+      });
+    }
+  }
+
+  // Duplicate names across all workflows
+  const nameCounts = {};
+  for (const wf of workflows) {
+    const n = (wf.name || '').trim().toLowerCase();
+    nameCounts[n] = (nameCounts[n] || []).concat(wf.id);
+  }
+  for (const [name, ids] of Object.entries(nameCounts)) {
+    if (ids.length > 1 && !JUNK_NAME_PATTERN.test(name)) {
+      findings.push({
+        severity: 'warning', workflowId: ids.join(', '), workflowName: name,
+        objectTypeId: '—', isEnabled: '—',
+        issue: `Duplicate workflow name (${ids.length} workflows)`,
+        recommendation: `${ids.length} workflows share the name "${name}". Rename them to distinguish their purpose.`,
+      });
+    }
+  }
+
+  return findings;
 }
 
 // ─── Fix Plan ────────────────────────────────────────────────────────────────
@@ -660,7 +811,7 @@ function limitBar(percentage) {
 }
 
 function generateHtml(data, findings) {
-  const { objects, associations, pipelines, limits, validations, fixPlan } = data;
+  const { objects, associations, pipelines, limits, validations, fixPlan, workflows, workflowFindings } = data;
   const criticalCount = findings.filter((f) => f.severity === 'critical').length;
   const warningCount = findings.filter((f) => f.severity === 'warning').length;
   const infoCount = findings.filter((f) => f.severity === 'info').length;
@@ -672,6 +823,8 @@ function generateHtml(data, findings) {
   const dataModelUrl = PORTAL_ID
     ? `https://app.hubspot.com/contacts/${PORTAL_ID}/objects/data-model-overview`
     : 'https://app.hubspot.com/l/data-model-overview/';
+  const dqUrl = 'https://app.hubspot.com/l/data-quality/';
+  const dqKbUrl = 'https://knowledge.hubspot.com/data-management/use-data-quality-tools';
 
   const contactCentric = ['contacts', 'companies', 'deals', 'tickets', 'leads', 'quotes', 'invoices'];
   const dealPipeline = ['deals', 'contacts', 'companies', 'line_items', 'quotes', 'tickets'];
@@ -885,7 +1038,11 @@ function generateHtml(data, findings) {
       <h1>HubSpot CRM Schema Audit</h1>
       <div class="meta">Generated ${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' })}${PORTAL_ID ? ` · Portal ${PORTAL_ID}` : ''}</div>
     </div>
-    <a href="${dataModelUrl}" target="_blank">Open in HubSpot Data Model Viewer →</a>
+    <div style="display:flex;gap:1rem;flex-wrap:wrap">
+      <a href="${dataModelUrl}" target="_blank">Data Model Viewer →</a>
+      <a href="${dqUrl}" target="_blank">Data Quality Command Center →</a>
+      <a href="${dqKbUrl}" target="_blank" style="color:rgba(255,255,255,.5);font-size:.8rem">DQ Tools guide ↗</a>
+    </div>
   </header>
   <main>
 
@@ -928,6 +1085,15 @@ function generateHtml(data, findings) {
           <div class="number">${infoCount}</div>
           <div class="label">Info Findings</div>
         </div>
+        ${workflows ? `
+        <div class="stat-card">
+          <div class="number">${workflows.length}</div>
+          <div class="label">Total Workflows</div>
+        </div>
+        <div class="stat-card active">
+          <div class="number">${workflows.filter((w) => w.isEnabled).length}</div>
+          <div class="label">Enabled Workflows</div>
+        </div>` : ''}
       </div>
     </section>
 
@@ -1032,6 +1198,59 @@ function generateHtml(data, findings) {
         </table>
       </div>
     </section>`;
+})() : ''}
+
+    ${workflows && workflows.length > 0 ? (() => {
+  const wfObjMap = {'0-1':'Contacts','0-2':'Companies','0-3':'Deals','0-5':'Tickets','0-421':'Appointments','0-136':'Leads','0-123':'Orders','0-162':'Services','0-410':'Courses','0-420':'Listings','0-74':'Goals','0-14':'Quotes','0-11':'Conversations'};
+  const enrollTypeLabel = {'EVENT_BASED':'Event-based','LIST_BASED':'List-based','MANUAL':'Manual','DATASET':'Dataset'};
+  const actionTypeCounts = {};
+  for (const wf of workflows) {
+    for (const a of (wf.actions || [])) {
+      const k = ACTION_TYPE_LABELS[a.actionTypeId || a.type] || a.actionTypeId || a.type || 'Unknown';
+      actionTypeCounts[k] = (actionTypeCounts[k] || 0) + 1;
+    }
+  }
+  const enrollCounts = {};
+  for (const wf of workflows) {
+    const t = enrollTypeLabel[wf.enrollmentCriteria?.type] || wf.enrollmentCriteria?.type || 'Unknown';
+    enrollCounts[t] = (enrollCounts[t] || 0) + 1;
+  }
+  const noActions = workflows.filter((w) => !(w.actions || []).length);
+  const enabled = workflows.filter((w) => w.isEnabled);
+  const wfFindingRows = (workflowFindings || []).map((f) => {
+    const badge = f.severity === 'critical' ? '<span class="badge badge-critical">Critical</span>' : f.severity === 'warning' ? '<span class="badge badge-warning">Warning</span>' : '<span class="badge badge-info">Info</span>';
+    const objLabel = wfObjMap[f.objectTypeId] || f.objectTypeId || '—';
+    const enabledBadge = f.isEnabled === true ? '<span class="badge badge-active">On</span>' : f.isEnabled === false ? '<span class="badge badge-empty">Off</span>' : '—';
+    return `<tr data-severity="${f.severity}"><td class="shrink">${badge}</td><td class="shrink">${enabledBadge}</td><td><a href="https://app.hubspot.com/workflows/${PORTAL_ID}/platform/flow/${f.workflowId}/edit" target="_blank">${f.workflowName}</a></td><td class="shrink">${objLabel}</td><td class="shrink">${f.issue}</td><td class="grow">${f.recommendation}</td></tr>`;
+  }).join('');
+  return `<section>
+    <h2>Workflow Audit</h2>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-bottom:1.5rem">
+      <div class="stat-card"><div class="number">${workflows.length}</div><div class="label">Total Workflows</div></div>
+      <div class="stat-card active"><div class="number">${enabled.length}</div><div class="label">Enabled</div></div>
+      <div class="stat-card"><div class="number">${workflows.length - enabled.length}</div><div class="label">Disabled</div></div>
+      <div class="stat-card critical"><div class="number">${noActions.length}</div><div class="label">No Actions</div></div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;margin-bottom:1.5rem">
+      <div>
+        <h3 style="margin-bottom:.5rem">By enrollment type</h3>
+        <table><thead><tr><th>Type</th><th class="num">Count</th></tr></thead><tbody>
+          ${Object.entries(enrollCounts).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`<tr><td>${k}</td><td class="num">${v}</td></tr>`).join('')}
+        </tbody></table>
+      </div>
+      <div>
+        <h3 style="margin-bottom:.5rem">Action types in use</h3>
+        <table><thead><tr><th>Action</th><th class="num">Count</th></tr></thead><tbody>
+          ${Object.entries(actionTypeCounts).sort((a,b)=>b[1]-a[1]).slice(0,12).map(([k,v])=>`<tr><td>${k}</td><td class="num">${v}</td></tr>`).join('')}
+        </tbody></table>
+      </div>
+    </div>
+    ${wfFindingRows ? `<h3 style="margin-bottom:.75rem">Workflow Findings (${(workflowFindings||[]).length})</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th class="shrink">Severity</th><th class="shrink">Status</th><th>Workflow</th><th class="shrink">Object</th><th class="shrink">Issue</th><th>Recommendation</th></tr></thead>
+      <tbody>${wfFindingRows}</tbody>
+    </table></div>` : '<p style="color:#999;font-style:italic">No workflow issues found.</p>'}
+  </section>`;
 })() : ''}
 
     <section>
@@ -1223,16 +1442,32 @@ async function main() {
   }
   if (validations.length > 0) console.log(`  Found ${validations.length} property validation rule(s)`);
 
-  // 6. Analysis
-  console.log('\n[6/7] Running property analysis...');
+  // 6. Workflows
+  let workflows = [], workflowFindings = [];
+  if (AUDIT_WORKFLOWS) {
+    console.log('\n[6/8] Auditing workflows...');
+    workflows = await getWorkflows();
+    const enabled = workflows.filter((w) => w.isEnabled).length;
+    const noActions = workflows.filter((w) => !(w.actions || []).length).length;
+    console.log(`  ${workflows.length} workflows (${enabled} enabled, ${noActions} with no actions)`);
+    workflowFindings = analyzeWorkflows(workflows);
+    const wfCrit = workflowFindings.filter((f) => f.severity === 'critical').length;
+    const wfWarn = workflowFindings.filter((f) => f.severity === 'warning').length;
+    console.log(`  ${workflowFindings.length} findings: ${wfCrit} critical, ${wfWarn} warnings`);
+  } else {
+    console.log('\n[6/8] Workflows skipped (set AUDIT_WORKFLOWS=1 to enable)');
+  }
+
+  // 7. Analysis
+  console.log('\n[7/8] Running property analysis...');
   const findings = analyzeProperties(objects);
   const critical = findings.filter((f) => f.severity === 'critical').length;
   const warnings = findings.filter((f) => f.severity === 'warning').length;
   const info = findings.filter((f) => f.severity === 'info').length;
   console.log(`  ${findings.length} findings: ${critical} critical, ${warnings} warnings, ${info} info`);
 
-  // 7. Fix plan
-  console.log(`\n[7/7] Building fix plan${CHECK_VALUES ? ' (CHECK_VALUES=1: checking property value counts)' : ''}...`);
+  // 8. Fix plan
+  console.log(`\n[8/8] Building fix plan${CHECK_VALUES ? ' (CHECK_VALUES=1: checking property value counts)' : ''}...`);
   const fixPlan = await buildFixPlan(objects, findings, pipelines, pipelineRecordCounts);
   const fp1 = fixPlan.filter((f) => f.tier === 1).length;
   const fp2 = fixPlan.filter((f) => f.tier === 2).length;
@@ -1252,6 +1487,8 @@ async function main() {
     associations,
     limits,
     validations,
+    workflows,
+    workflowFindings,
     findings,
     fixPlan,
   };

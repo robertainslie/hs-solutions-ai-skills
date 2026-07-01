@@ -308,7 +308,7 @@ The audit calls all limits tracking endpoints to build a complete picture of usa
   - Pipelines section (per-object pipeline and stage breakdown)
   - CRM Limits dashboard (record limits, property limits, pipeline limits — % used)
   - Property Validations section
-  - Three Mermaid.js ERD tabs: Full Model, Contact-Centric, Deal Pipeline
+  - Three interactive D3.js force-directed ERD tabs: Full Model, Contact-Centric, Deal Pipeline (drag nodes, zoom/pan, click for details)
   - Filterable findings table
   - Recommended cleanup order
   - Link to HubSpot Data Model Viewer
@@ -328,6 +328,47 @@ When reviewing findings with the user:
 7. **Missing descriptions** — Help write concise descriptions for custom properties without them.
 8. **Naming inconsistencies** — Recommend a `snake_case` naming convention for all custom property API names.
 
+## AI-Guided Fix Walk-Through
+
+After the audit generates `fix-plan.json`, you can walk the user through fixes conversationally:
+
+1. Read `fix-plan.json`
+2. Present each fix item one at a time:
+   - Show: tier, type, object, reason, record counts
+   - Ask: "Shall I apply this fix?"
+3. When approved, execute with: `node fix.js --item <fixId> --execute`
+4. Parse the JSON result line printed to stdout and report it to the user
+5. Move to the next item
+
+**Tier 1 (archive-empty-duplicate, archive-pipeline)**:
+```
+node fix.js --item FIX-001 --execute
+```
+
+**Tier 2 (migrate-and-archive)**: Confirm which property to keep first:
+```
+node fix.js --item FIX-002 --execute
+```
+Uses the `canonicalProperty` from the plan. A backup JSON is written before migration.
+
+**Tier 2 (archive-pipeline-with-records)**: Requires destination pipeline ID:
+```bash
+# Step 1: Get available pipelines
+node -e "const https=require('https');const r=https.request({hostname:'api.hubapi.com',path:'/crm/v3/pipelines/deals',headers:{Authorization:'Bearer '+process.env.HUBSPOT_ACCESS_TOKEN}},res=>{let d='';res.on('data',c=>d+=c);res.on('end',()=>JSON.parse(d).results.forEach(p=>console.log(p.id,p.label)))});r.end()"
+# Step 2: Execute with chosen destination
+node fix.js --item FIX-003 --dest-pipeline <pipelineId> --execute
+```
+
+**Tier 3**: Present as recommendations only — no execution available.
+
+**Data backup**: Enabled by default (`--no-backup` to disable). A `backup-{fixId}.json` is written before each destructive operation for recovery.
+
+**JSON result format** (from `--item` mode):
+```json
+{"fixId":"FIX-001","status":"success","message":"Archived pipeline 'Service Pipeline' on deals"}
+```
+Status values: `success`, `dry-run`, `skipped`, `error`
+
 ## Troubleshooting
 
 - **401 Unauthorized**: Token is invalid or expired. Ask the user to regenerate their Private App token.
@@ -336,3 +377,5 @@ When reviewing findings with the user:
 - **No pipelines returned**: The object may not have any pipelines configured, or the object doesn't support pipelines in the current HubSpot tier.
 - **Limits endpoint returns null**: Some limits (calculated properties, association labels, custom objects) require Professional or Enterprise tier.
 - **CLI not found**: Script automatically falls back to REST API — this is expected and fine.
+- **Workflow connection graph empty**: Requires workflows with list-based enrollment or set-property actions referencing shared properties.
+- **fix.js 403 on property archive**: Property may be in use by a Form, List, or Workflow. Run the property-dependency skill first to find and remove the blocking references.

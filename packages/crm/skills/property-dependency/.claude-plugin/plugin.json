@@ -1,0 +1,14 @@
+{
+  "name": "property-dependency",
+  "description": "Map HubSpot CRM properties to the assets that reference them (Forms, Lists, Workflows) to identify what is safe to archive",
+  "version": "1.0.0",
+  "author": "HubSpot Solutions",
+  "skillPath": "../skill.md",
+  "commands": [
+    {
+      "name": "property-dependency",
+      "description": "Run the property dependency mapper",
+      "script": "../src/dependency.js"
+    }
+  ]
+}

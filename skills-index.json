@@ -21,7 +21,30 @@
         "review pipelines",
         "which objects are in use",
         "property validation rules",
-        "unique identifier properties"
+        "unique identifier properties",
+        "audit workflows",
+        "workflow connection graph"
+      ]
+    },
+    {
+      "id": "property-dependency",
+      "domain": "crm",
+      "name": "Property Dependency Mapper",
+      "description": "Maps every custom CRM property to the assets that reference it: Forms, Lists (segments), and Workflows (enrollment triggers and set-property actions). Identifies which properties are safe to archive (0 usages) vs. blocked by active assets. Also surfaces properties with field-level access restrictions (Enterprise).",
+      "formats": ["claude-code", "agent-cli", "plugin"],
+      "auth": ["HUBSPOT_ACCESS_TOKEN"],
+      "path": "packages/crm/skills/property-dependency",
+      "tags": ["crm", "properties", "forms", "lists", "segments", "workflows", "data-quality", "dependency", "archive", "cleanup"],
+      "triggers": [
+        "which properties are safe to delete",
+        "what is using this property",
+        "property dependency map",
+        "find unused properties",
+        "why can't I delete this property",
+        "property archive check",
+        "forms lists workflows property usage",
+        "property cleanup",
+        "blocking assets for property"
       ]
     }
   ]

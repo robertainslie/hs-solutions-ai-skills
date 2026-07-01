@@ -4,5 +4,8 @@ audit-data.json
 audit-report.html
 fix-plan.json
 fix-log.json
+backup-FIX-*.json
+dependency-data.json
+dependency-report.html
 node_modules/
 .claude/settings.local.json

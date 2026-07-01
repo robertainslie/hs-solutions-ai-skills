@@ -62,11 +62,47 @@ node packages/crm/skills/crm-schema-audit/src/fix.js
 # Execute interactively — prompts per fix group
 node packages/crm/skills/crm-schema-audit/src/fix.js --execute
 
+# Execute a single fix by ID (used by Claude in AI-guided mode)
+node packages/crm/skills/crm-schema-audit/src/fix.js --item FIX-001 --execute
+
+# Pipeline-with-records fix (requires destination pipeline ID)
+node packages/crm/skills/crm-schema-audit/src/fix.js --item FIX-003 --dest-pipeline <id> --execute
+
 # Use a specific plan file
 node packages/crm/skills/crm-schema-audit/src/fix.js --plan ./reports/fix-plan.json --execute
+
+# Skip data backup (not recommended)
+node packages/crm/skills/crm-schema-audit/src/fix.js --execute --no-backup
 ```
 
 Fix.js requires write scopes (`crm.schemas.*.write`, `crm.objects.*.write`) in addition to read scopes.
+
+**AI-guided flow**: `--item FIX-001 --execute` runs a single fix and prints a JSON result line for Claude to parse. Backups are written to `backup-{fixId}.json` before each destructive operation.
+
+## Running the Property Dependency Mapper
+
+Requires `HUBSPOT_ACCESS_TOKEN` with `forms` + `crm.lists.read` + `automation` scopes in addition to standard CRM read scopes.
+
+```bash
+# From any directory (report lands in cwd)
+export HUBSPOT_ACCESS_TOKEN=pat-na1-...
+node packages/crm/skills/property-dependency/src/dependency.js
+
+# Also map HubSpot-defined properties (larger output)
+INCLUDE_NATIVE=1 node packages/crm/skills/property-dependency/src/dependency.js
+```
+
+**Environment variables:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HUBSPOT_ACCESS_TOKEN` | — | Required. Private App token |
+| `OUTPUT_DIR` | cwd | Where to write output files |
+| `INCLUDE_NATIVE` | `0` | `1` = also map HubSpot-defined properties |
+
+**Outputs:**
+- `dependency-data.json` — full property dependency map
+- `dependency-report.html` — interactive report (matrix, safe-to-archive list, blocked list)
 
 ## Adding a New Skill
 

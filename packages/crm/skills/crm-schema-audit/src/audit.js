@@ -759,40 +759,195 @@ function analyzeProperties(allObjects) {
   return findings;
 }
 
-// ─── ERD Generation ──────────────────────────────────────────────────────────
+// ─── ERD Generation (D3.js) ──────────────────────────────────────────────────
 
-function sanitizeName(name) {
-  const upper = name.toUpperCase().replace(/[^A-Z0-9_]/g, '_');
-  // Mermaid entity names must start with a letter
-  return /^[A-Z]/.test(upper) ? upper : 'OBJ_' + upper;
-}
-
-function buildMermaidERD(objects, associations, filter) {
-  const filtered = filter ? objects.filter(filter) : objects;
+function buildD3ERDData(objects, associations, filterNames) {
+  const filtered = filterNames
+    ? objects.filter((o) => filterNames.includes(o.name))
+    : objects;
   const objNames = new Set(filtered.map((o) => o.name));
-  let diagram = 'erDiagram\n';
-  for (const obj of filtered) {
-    const safe = sanitizeName(obj.name);
-    const keyProps = (obj.properties || [])
-      .filter((p) => p.name.startsWith('hs_') || ['name', 'email', 'firstname', 'lastname', 'domain', 'dealname', 'subject', 'content'].includes(p.name))
-      .slice(0, 5);
-    diagram += `  ${safe} {\n`;
-    for (const p of keyProps) {
-      const ft = (p.type || 'string').replace(/[^a-zA-Z]/g, '');
-      diagram += `    ${ft} ${p.name.replace(/[^a-zA-Z0-9_]/g, '_')}\n`;
-    }
-    diagram += '  }\n';
-  }
+
+  const KEY_PROPS = new Set(['name', 'email', 'firstname', 'lastname', 'domain', 'dealname', 'subject', 'content', 'title', 'amount', 'closedate']);
+
+  const nodes = filtered.map((o) => {
+    const props = (o.properties || []);
+    const customPropCount = props.filter((p) => !p.hubspotDefined).length;
+    const keyProps = props
+      .filter((p) => p.name.startsWith('hs_') || KEY_PROPS.has(p.name))
+      .slice(0, 6)
+      .map((p) => ({ name: p.name, type: p.type || 'string' }));
+    return {
+      id: o.name,
+      label: o.label || o.name,
+      isCustom: o.isCustom || false,
+      inUse: !!(o.usage && o.usage.inUse),
+      accessible: o.usage ? o.usage.accessible !== false : true,
+      propertyCount: props.length,
+      customPropertyCount: customPropCount,
+      keyProperties: keyProps,
+    };
+  });
+
   const seen = new Set();
+  const links = [];
   for (const assoc of associations) {
     if (!objNames.has(assoc.fromType) || !objNames.has(assoc.toType)) continue;
-    const key = `${assoc.fromType}-${assoc.toType}`;
-    if (seen.has(key)) continue;
+    const key = [assoc.fromType, assoc.toType].sort().join('|');
+    if (seen.has(key)) {
+      const existing = links.find((l) => l.key === key);
+      if (existing) existing.count++;
+      continue;
+    }
     seen.add(key);
-    const lbl = (assoc.label || '').replace(/"/g, '').slice(0, 30);
-    diagram += `  ${sanitizeName(assoc.fromType)} }o--o{ ${sanitizeName(assoc.toType)} : "${lbl}"\n`;
+    links.push({
+      key,
+      source: assoc.fromType,
+      target: assoc.toType,
+      label: (assoc.label || '').slice(0, 25),
+      count: 1,
+    });
   }
-  return diagram;
+
+  return { nodes, links };
+}
+
+// ─── Workflow Connection Graph ────────────────────────────────────────────────
+
+function buildWorkflowConnections(workflows) {
+  if (!workflows || !workflows.length) return { nodes: [], edges: [] };
+
+  function extractFilterBranchProps(branch, props = new Set()) {
+    if (!branch) return props;
+    for (const f of branch.filters || []) {
+      if (f.filterType === 'PROPERTY' && f.property) props.add(f.property);
+    }
+    for (const sub of branch.filterBranches || []) extractFilterBranchProps(sub, props);
+    return props;
+  }
+
+  function extractListIds(branch, ids = new Set()) {
+    if (!branch) return ids;
+    for (const f of branch.filters || []) {
+      // Various filter types that reference a list
+      const op = f.operation || {};
+      if (op.listId) ids.add(String(op.listId));
+      if (f.listId) ids.add(String(f.listId));
+    }
+    for (const sub of branch.filterBranches || []) extractListIds(sub, ids);
+    return ids;
+  }
+
+  // Extract per-workflow fingerprint
+  const wfMeta = workflows.map((wf) => {
+    const enrollment = wf.enrollmentCriteria || {};
+    const actions = wf.actions || [];
+
+    const triggerListIds = extractListIds(enrollment.listFilterBranch);
+    const triggerProps = extractFilterBranchProps(enrollment.listFilterBranch);
+
+    // Event-based: property-change event (4-655002) exposes properties in filters
+    for (const eb of enrollment.eventFilterBranches || []) {
+      for (const f of eb.filters || []) {
+        if (f.property) triggerProps.add(f.property);
+      }
+    }
+
+    const setProps = new Set();
+    const enrollsInto = new Set();
+    for (const action of actions) {
+      if (action.actionTypeId === '0-5' && action.fields?.property_name) {
+        setProps.add(action.fields.property_name);
+      }
+      // Detect "Enroll in workflow" action — look for any actionTypeId with a targetWorkflowId field
+      if (action.fields?.targetWorkflowId) enrollsInto.add(String(action.fields.targetWorkflowId));
+      if (action.fields?.workflowId) enrollsInto.add(String(action.fields.workflowId));
+    }
+
+    return {
+      id: String(wf.id),
+      name: wf.name || String(wf.id),
+      objectTypeId: wf.objectTypeId,
+      isEnabled: wf.isEnabled,
+      actionCount: actions.length,
+      enrollmentType: wf.enrollmentCriteria?.type || 'UNKNOWN',
+      triggerListIds: [...triggerListIds],
+      triggerProps: [...triggerProps],
+      setProps: [...setProps],
+      enrollsInto: [...enrollsInto],
+    };
+  });
+
+  // Build edges
+  const edges = [];
+  const edgeKey = (a, b, type) => `${[a, b].sort().join('|')}:${type}`;
+  const seen = new Set();
+
+  for (let i = 0; i < wfMeta.length; i++) {
+    for (let j = i + 1; j < wfMeta.length; j++) {
+      const a = wfMeta[i];
+      const b = wfMeta[j];
+      if (a.objectTypeId !== b.objectTypeId) continue; // only same-object connections
+
+      // shared-list: both enroll from the same list
+      const sharedLists = a.triggerListIds.filter((id) => b.triggerListIds.includes(id));
+      if (sharedLists.length) {
+        const k = edgeKey(a.id, b.id, 'shared-list');
+        if (!seen.has(k)) { seen.add(k); edges.push({ source: a.id, target: b.id, type: 'shared-list', detail: `Shared list(s): ${sharedLists.join(', ')}` }); }
+      }
+
+      // trigger-chain: A sets a property that B is triggered by (or vice versa)
+      const aTriggersB = a.setProps.filter((p) => b.triggerProps.includes(p));
+      if (aTriggersB.length) {
+        const k = `${a.id}->${b.id}:trigger-chain`;
+        if (!seen.has(k)) { seen.add(k); edges.push({ source: a.id, target: b.id, type: 'trigger-chain', detail: `${a.name} sets → ${b.name} triggered by: ${aTriggersB.join(', ')}` }); }
+      }
+      const bTriggersA = b.setProps.filter((p) => a.triggerProps.includes(p));
+      if (bTriggersA.length) {
+        const k = `${b.id}->${a.id}:trigger-chain`;
+        if (!seen.has(k)) { seen.add(k); edges.push({ source: b.id, target: a.id, type: 'trigger-chain', detail: `${b.name} sets → ${a.name} triggered by: ${bTriggersA.join(', ')}` }); }
+      }
+
+      // shared-trigger: both triggered by same property (competing)
+      const sharedTriggers = a.triggerProps.filter((p) => b.triggerProps.includes(p));
+      if (sharedTriggers.length) {
+        const k = edgeKey(a.id, b.id, 'shared-trigger');
+        if (!seen.has(k)) { seen.add(k); edges.push({ source: a.id, target: b.id, type: 'shared-trigger', detail: `Both triggered by: ${sharedTriggers.join(', ')}` }); }
+      }
+
+      // shared-write: both set the same property (conflict risk)
+      const sharedWrites = a.setProps.filter((p) => b.setProps.includes(p));
+      if (sharedWrites.length) {
+        const k = edgeKey(a.id, b.id, 'shared-write');
+        if (!seen.has(k)) { seen.add(k); edges.push({ source: a.id, target: b.id, type: 'shared-write', detail: `Both set: ${sharedWrites.join(', ')}` }); }
+      }
+    }
+
+    // cross-enroll: explicit "enroll in workflow" actions
+    const a = wfMeta[i];
+    for (const targetId of a.enrollsInto) {
+      const k = `${a.id}->${targetId}:cross-enroll`;
+      if (!seen.has(k)) { seen.add(k); edges.push({ source: a.id, target: targetId, type: 'cross-enroll', detail: `${a.name} enrolls into workflow ${targetId}` }); }
+    }
+  }
+
+  // Property highway: top properties connecting the most workflows
+  const propCounts = {};
+  for (const wf of wfMeta) {
+    for (const p of [...wf.triggerProps, ...wf.setProps]) {
+      propCounts[p] = (propCounts[p] || new Set()).add(wf.id);
+    }
+  }
+  const highway = Object.entries(propCounts)
+    .map(([prop, wfSet]) => ({ property: prop, workflowCount: wfSet.size }))
+    .filter((e) => e.workflowCount > 1)
+    .sort((a, b) => b.workflowCount - a.workflowCount)
+    .slice(0, 10);
+
+  return {
+    nodes: wfMeta,
+    edges,
+    highway,
+  };
 }
 
 // ─── HTML Report ─────────────────────────────────────────────────────────────
@@ -811,7 +966,7 @@ function limitBar(percentage) {
 }
 
 function generateHtml(data, findings) {
-  const { objects, associations, pipelines, limits, validations, fixPlan, workflows, workflowFindings } = data;
+  const { objects, associations, pipelines, limits, validations, fixPlan, workflows, workflowFindings, workflowConnections } = data;
   const criticalCount = findings.filter((f) => f.severity === 'critical').length;
   const warningCount = findings.filter((f) => f.severity === 'warning').length;
   const infoCount = findings.filter((f) => f.severity === 'info').length;
@@ -829,9 +984,9 @@ function generateHtml(data, findings) {
   const contactCentric = ['contacts', 'companies', 'deals', 'tickets', 'leads', 'quotes', 'invoices'];
   const dealPipeline = ['deals', 'contacts', 'companies', 'line_items', 'quotes', 'tickets'];
 
-  const erdFull = buildMermaidERD(objects, associations, null);
-  const erdContacts = buildMermaidERD(objects, associations, (o) => contactCentric.includes(o.name));
-  const erdDeals = buildMermaidERD(objects, associations, (o) => dealPipeline.includes(o.name));
+  const erdDataFull     = JSON.stringify(buildD3ERDData(objects, associations, null));
+  const erdDataContacts = JSON.stringify(buildD3ERDData(objects, associations, contactCentric));
+  const erdDataDeals    = JSON.stringify(buildD3ERDData(objects, associations, dealPipeline));
 
   // Object inventory rows
   const objectRows = objects.map((o) => {
@@ -963,7 +1118,7 @@ function generateHtml(data, findings) {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>HubSpot CRM Schema Audit</title>
-  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
   <style>
     :root {
       --hs-orange:#ff7a59;--hs-blue:#00a4bd;--hs-dark:#2d3e50;--hs-gray:#f5f8fa;
@@ -991,9 +1146,23 @@ function generateHtml(data, findings) {
     .tabs{display:flex;gap:.5rem;margin-bottom:1rem;flex-wrap:wrap}
     .tab{padding:.4rem 1rem;border-radius:20px;border:2px solid #ddd;background:white;cursor:pointer;font-size:.85rem;transition:all .15s}
     .tab.active{background:var(--hs-dark);color:white;border-color:var(--hs-dark)}
-    .erd-panel{display:none;overflow-x:auto}
+    .erd-panel{display:none}
     .erd-panel.active{display:block}
-    .erd-panel pre.mermaid{background:var(--hs-gray);border-radius:6px;padding:1rem}
+    .graph-canvas{width:100%;height:560px;border:1px solid #eee;border-radius:6px;background:var(--hs-gray);cursor:grab;position:relative;overflow:hidden}
+    .graph-canvas:active{cursor:grabbing}
+    .graph-hint{font-size:.8rem;color:#999;margin-bottom:.5rem}
+    .graph-legend{display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:.75rem;font-size:.8rem}
+    .legend-item{display:flex;align-items:center;gap:.35rem}
+    .legend-dot{width:12px;height:12px;border-radius:50%;display:inline-block}
+    .node-detail{position:absolute;top:10px;right:10px;background:white;border:1px solid #ddd;border-radius:6px;padding:.75rem 1rem;font-size:.8rem;max-width:220px;box-shadow:0 2px 8px rgba(0,0,0,.12);display:none;word-break:break-word;z-index:10}
+    .node-detail.visible{display:block}
+    .node-detail h4{margin-bottom:.4rem;font-size:.85rem}
+    .node-detail p{margin:.2rem 0;color:#555}
+    .node-detail ul{margin:.3rem 0 0 1rem;padding:0}
+    .node-detail li{margin:.15rem 0;color:#666}
+    .wf-filters{display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.75rem}
+    .wf-filter-btn{padding:.25rem .75rem;border-radius:20px;border:1px solid #ddd;background:white;cursor:pointer;font-size:.8rem;transition:all .15s}
+    .wf-filter-btn.active{color:white;border-color:transparent}
     .filter-bar{display:flex;gap:.75rem;margin-bottom:1rem;flex-wrap:wrap;align-items:center}
     .filter-bar label{font-size:.85rem;font-weight:500}
     .filter-bar select{padding:.3rem .6rem;border:1px solid #ddd;border-radius:4px;font-size:.85rem}
@@ -1159,14 +1328,21 @@ function generateHtml(data, findings) {
 
     <section>
       <h2>Data Model ERDs</h2>
-      <div class="tabs">
-        <button class="tab active" onclick="showTab('full')">Full Model</button>
-        <button class="tab" onclick="showTab('contacts')">Contact-Centric</button>
-        <button class="tab" onclick="showTab('deals')">Deal Pipeline</button>
+      <div class="graph-legend">
+        <div class="legend-item"><div class="legend-dot" style="background:var(--hs-orange)"></div> Native (in use)</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#c8d6e0"></div> Native (empty)</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#8e44ad"></div> Custom object</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#bbb"></div> No access</div>
+        <span style="color:#999;font-size:.8rem">Node size = custom property count · Edge thickness = association types · Drag nodes · Scroll to zoom · Click for details</span>
       </div>
-      <div id="erd-full" class="erd-panel active"><pre class="mermaid">${erdFull}</pre></div>
-      <div id="erd-contacts" class="erd-panel"><pre class="mermaid">${erdContacts}</pre></div>
-      <div id="erd-deals" class="erd-panel"><pre class="mermaid">${erdDeals}</pre></div>
+      <div class="tabs">
+        <button class="tab active" onclick="showTab('full',event)">Full Model</button>
+        <button class="tab" onclick="showTab('contacts',event)">Contact-Centric</button>
+        <button class="tab" onclick="showTab('deals',event)">Deal Pipeline</button>
+      </div>
+      <div id="erd-full" class="erd-panel active"><div class="graph-canvas" id="canvas-full"><div class="node-detail" id="detail-full"></div></div></div>
+      <div id="erd-contacts" class="erd-panel"><div class="graph-canvas" id="canvas-contacts"><div class="node-detail" id="detail-contacts"></div></div></div>
+      <div id="erd-deals" class="erd-panel"><div class="graph-canvas" id="canvas-deals"><div class="node-detail" id="detail-deals"></div></div></div>
     </section>
 
     ${fixPlan && fixPlan.length > 0 ? (() => {
@@ -1253,6 +1429,34 @@ function generateHtml(data, findings) {
   </section>`;
 })() : ''}
 
+    ${workflowConnections && workflowConnections.edges && workflowConnections.edges.length > 0 ? (() => {
+  const wc = workflowConnections;
+  const edgeTypes = [
+    { type: 'trigger-chain', label: 'Property trigger chain', color: '#ff7a59' },
+    { type: 'shared-list',   label: 'Shared enrollment list',  color: '#00a4bd' },
+    { type: 'cross-enroll',  label: 'Cross-enrollment',        color: '#c0392b' },
+    { type: 'shared-trigger',label: 'Shared trigger property', color: '#8e44ad' },
+    { type: 'shared-write',  label: 'Shared property write',   color: '#e67e22' },
+  ].filter((et) => wc.edges.some((e) => e.type === et.type));
+  const highwayRows = (wc.highway || []).map((h) => `<tr><td><code>${h.property}</code></td><td class="num">${h.workflowCount}</td></tr>`).join('');
+  return `<section>
+    <h2>Workflow Connection Graph</h2>
+    <p style="font-size:.875rem;color:#555;margin-bottom:1rem">${wc.nodes.length} workflows · ${wc.edges.length} connection(s) found. Drag nodes · scroll to zoom · click for details.</p>
+    <div class="graph-legend">
+      ${edgeTypes.map((et) => `<div class="legend-item"><div style="width:24px;height:3px;background:${et.color};border-radius:2px;display:inline-block"></div> ${et.label}</div>`).join('')}
+      <div class="legend-item"><div class="legend-dot" style="background:#27ae60"></div> Enabled</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#bbb"></div> Disabled</div>
+    </div>
+    <div style="display:flex;gap:.5rem;margin-bottom:.75rem;flex-wrap:wrap;align-items:center">
+      ${edgeTypes.map((et) => `<button class="wf-filter-btn active" data-type="${et.type}" style="background:${et.color}" onclick="toggleWfEdge('${et.type}',this)">${et.label}</button>`).join('')}
+      <label style="margin-left:.5rem;font-size:.8rem">Search: <input type="text" id="wf-search" placeholder="workflow name..." style="padding:.2rem .5rem;border:1px solid #ddd;border-radius:4px;font-size:.8rem;width:160px" oninput="filterWfNodes()"></label>
+    </div>
+    <div class="graph-canvas" id="canvas-wf" style="height:620px"><div class="node-detail" id="detail-wf"></div></div>
+    ${highwayRows ? `<div style="margin-top:1rem"><h3 style="margin-bottom:.5rem">Property Highway (top properties connecting workflows)</h3>
+    <div class="table-wrap"><table style="max-width:400px"><thead><tr><th>Property</th><th class="num">Workflows</th></tr></thead><tbody>${highwayRows}</tbody></table></div></div>` : ''}
+  </section>`;
+})() : ''}
+
     <section>
       <h2>Audit Findings (${findings.length} total)</h2>
       <div class="filter-bar">
@@ -1284,15 +1488,218 @@ function generateHtml(data, findings) {
 
   </main>
   <script>
-    mermaid.initialize({ startOnLoad: true, theme: 'default', er: { diagramPadding: 20, layoutDirection: 'TB' } });
+    // ── ERD Data ──────────────────────────────────────────────────────────────
+    const ERD = {
+      full:     ${erdDataFull},
+      contacts: ${erdDataContacts},
+      deals:    ${erdDataDeals},
+    };
+    const WF_DATA = ${JSON.stringify(workflowConnections || { nodes: [], edges: [], highway: [] })};
 
-    function showTab(name) {
+    // ── D3 ERD Renderer ───────────────────────────────────────────────────────
+    const rendered = new Set();
+
+    function renderERD(tabName) {
+      if (rendered.has(tabName)) return;
+      rendered.add(tabName);
+      const { nodes, links } = ERD[tabName];
+      const container = document.getElementById('canvas-' + tabName);
+      const detail = document.getElementById('detail-' + tabName);
+      const W = container.clientWidth, H = container.clientHeight || 560;
+
+      const nodeColor = (d) => {
+        if (!d.accessible) return '#bbb';
+        if (d.isCustom) return '#8e44ad';
+        return d.inUse ? '#ff7a59' : '#c8d6e0';
+      };
+      const nodeR = (d) => Math.max(12, Math.min(28, 12 + Math.sqrt(d.customPropertyCount || 0) * 2.5));
+
+      const svg = d3.select(container).append('svg')
+        .attr('width', '100%').attr('height', H)
+        .call(d3.zoom().scaleExtent([0.2, 4]).on('zoom', (e) => g.attr('transform', e.transform)))
+        .on('dblclick.zoom', null);
+      const g = svg.append('g');
+
+      // Arrow marker
+      svg.append('defs').append('marker')
+        .attr('id', 'arrow-' + tabName).attr('viewBox', '0 -5 10 10')
+        .attr('refX', 20).attr('refY', 0).attr('markerWidth', 6).attr('markerHeight', 6)
+        .attr('orient', 'auto')
+        .append('path').attr('d', 'M0,-5L10,0L0,5').attr('fill', '#aaa');
+
+      const sim = d3.forceSimulation(nodes)
+        .force('link', d3.forceLink(links).id((d) => d.id).distance(120))
+        .force('charge', d3.forceManyBody().strength(-300))
+        .force('center', d3.forceCenter(W / 2, H / 2))
+        .force('collision', d3.forceCollide().radius((d) => nodeR(d) + 8));
+
+      const link = g.append('g').selectAll('line').data(links).join('line')
+        .attr('stroke', '#aaa')
+        .attr('stroke-width', (d) => Math.max(1, Math.sqrt(d.count) * 1.5))
+        .attr('stroke-opacity', 0.6)
+        .attr('marker-end', 'url(#arrow-' + tabName + ')');
+
+      const linkLabel = g.append('g').selectAll('text').data(links.filter(d => d.label)).join('text')
+        .attr('font-size', 9).attr('fill', '#888').attr('text-anchor', 'middle');
+
+      const node = g.append('g').selectAll('g').data(nodes).join('g')
+        .attr('cursor', 'pointer')
+        .call(d3.drag()
+          .on('start', (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+          .on('drag',  (e, d) => { d.fx = e.x; d.fy = e.y; })
+          .on('end',   (e, d) => { if (!e.active) sim.alphaTarget(0); })
+        )
+        .on('click', (e, d) => {
+          e.stopPropagation();
+          detail.className = 'node-detail visible';
+          detail.innerHTML = '<h4>' + d.label + '</h4>' +
+            '<p>API name: <code>' + d.id + '</code></p>' +
+            '<p>' + (d.inUse ? '✓ In use' : d.accessible ? 'Empty' : 'No access') + ' · ' + d.propertyCount + ' properties (' + d.customPropertyCount + ' custom)</p>' +
+            (d.keyProperties.length ? '<ul>' + d.keyProperties.map(p => '<li><code>' + p.name + '</code></li>').join('') + '</ul>' : '');
+        });
+
+      node.append('circle')
+        .attr('r', nodeR).attr('fill', nodeColor).attr('stroke', 'white').attr('stroke-width', 2);
+      node.append('text')
+        .attr('dy', (d) => nodeR(d) + 11).attr('text-anchor', 'middle')
+        .attr('font-size', 10).attr('fill', '#444')
+        .text((d) => d.label.length > 16 ? d.label.slice(0, 14) + '…' : d.label);
+
+      svg.on('click', () => { detail.className = 'node-detail'; });
+
+      sim.on('tick', () => {
+        link.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+            .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+        linkLabel.attr('x', d => (d.source.x + d.target.x) / 2)
+                 .attr('y', d => (d.source.y + d.target.y) / 2)
+                 .text(d => d.label);
+        node.attr('transform', d => 'translate(' + d.x + ',' + d.y + ')');
+      });
+    }
+
+    function showTab(name, event) {
       document.querySelectorAll('.erd-panel').forEach(p => p.classList.remove('active'));
       document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
       document.getElementById('erd-' + name).classList.add('active');
       event.target.classList.add('active');
+      renderERD(name);
     }
 
+    // Render default tab on load
+    renderERD('full');
+
+    // ── Workflow Connection Graph ─────────────────────────────────────────────
+    (function() {
+      if (!WF_DATA || !WF_DATA.nodes || !WF_DATA.nodes.length) return;
+      const container = document.getElementById('canvas-wf');
+      if (!container) return;
+      const detail = document.getElementById('detail-wf');
+      const W = container.clientWidth, H = container.clientHeight || 620;
+
+      const EDGE_COLORS = {
+        'trigger-chain':  '#ff7a59',
+        'shared-list':    '#00a4bd',
+        'cross-enroll':   '#c0392b',
+        'shared-trigger': '#8e44ad',
+        'shared-write':   '#e67e22',
+      };
+
+      const nodes = WF_DATA.nodes.map(d => ({...d}));
+      let allEdges = WF_DATA.edges.map(d => ({...d}));
+      let activeTypes = new Set(Object.keys(EDGE_COLORS));
+      let searchFilter = '';
+
+      const nodeById = Object.fromEntries(nodes.map(n => [n.id, n]));
+      // Ensure cross-enroll targets exist as nodes
+      for (const e of allEdges) {
+        if (!nodeById[e.target]) { allEdges = allEdges.filter(x => x !== e); }
+        if (!nodeById[e.source]) { allEdges = allEdges.filter(x => x !== e); }
+      }
+
+      const svg = d3.select(container).append('svg')
+        .attr('width', '100%').attr('height', H)
+        .call(d3.zoom().scaleExtent([0.1, 4]).on('zoom', (e) => g.attr('transform', e.transform)))
+        .on('dblclick.zoom', null);
+      const g = svg.append('g');
+
+      svg.append('defs').selectAll('marker')
+        .data(Object.entries(EDGE_COLORS)).join('marker')
+        .attr('id', ([type]) => 'warrow-' + type.replace(/[^a-z]/g, ''))
+        .attr('viewBox', '0 -5 10 10').attr('refX', 18).attr('refY', 0)
+        .attr('markerWidth', 5).attr('markerHeight', 5).attr('orient', 'auto')
+        .append('path').attr('d', 'M0,-5L10,0L0,5').attr('fill', ([,color]) => color);
+
+      const sim = d3.forceSimulation(nodes)
+        .force('link', d3.forceLink([]).id(d => d.id).distance(90))
+        .force('charge', d3.forceManyBody().strength(-120))
+        .force('center', d3.forceCenter(W/2, H/2))
+        .force('collision', d3.forceCollide().radius(18));
+
+      const linkG = g.append('g');
+      const nodeG = g.append('g');
+
+      function redraw() {
+        const edges = allEdges.filter(e => activeTypes.has(e.type) &&
+          (!searchFilter || (nodeById[e.source] || nodeById[e.source.id] || {name:''}).name.toLowerCase().includes(searchFilter) ||
+           (nodeById[e.target] || nodeById[e.target.id] || {name:''}).name.toLowerCase().includes(searchFilter)));
+
+        sim.force('link').links(edges);
+        sim.alpha(0.3).restart();
+
+        const edgeSel = linkG.selectAll('line').data(edges, e => e.source.id+e.target.id+e.type);
+        edgeSel.exit().remove();
+        edgeSel.enter().append('line').merge(edgeSel)
+          .attr('stroke', e => EDGE_COLORS[e.type] || '#aaa')
+          .attr('stroke-width', 2).attr('stroke-opacity', 0.7)
+          .attr('marker-end', e => 'url(#warrow-' + e.type.replace(/[^a-z]/g,'') + ')')
+          .append('title').text(e => e.detail || e.type);
+
+        const nodeSel = nodeG.selectAll('g').data(nodes, d => d.id);
+        const nodeEnter = nodeSel.enter().append('g').attr('cursor','pointer')
+          .call(d3.drag()
+            .on('start',(e,d)=>{if(!e.active)sim.alphaTarget(0.3).restart();d.fx=d.x;d.fy=d.y;})
+            .on('drag',(e,d)=>{d.fx=e.x;d.fy=e.y;})
+            .on('end',(e,d)=>{if(!e.active)sim.alphaTarget(0);}))
+          .on('click',(e,d)=>{
+            e.stopPropagation();
+            detail.className='node-detail visible';
+            const wfUrl = '${PORTAL_ID ? `https://app.hubspot.com/workflows/${PORTAL_ID}/platform/flow/` : '#wf-'}' + d.id + '${PORTAL_ID ? '/edit' : ''}';
+            detail.innerHTML='<h4><a href="'+wfUrl+'" target="_blank">'+d.name+'</a></h4>'+
+              '<p>'+(d.isEnabled?'✓ Enabled':'✗ Disabled')+'</p>'+
+              '<p>'+d.enrollmentType+' enrollment · '+d.actionCount+' actions</p>'+
+              (d.triggerProps.length?'<p>Trigger props: '+d.triggerProps.slice(0,4).join(', ')+'</p>':'')+
+              (d.setProps.length?'<p>Sets: '+d.setProps.slice(0,4).join(', ')+'</p>':'');
+          });
+        nodeEnter.append('circle').attr('r',10).attr('stroke','white').attr('stroke-width',1.5);
+        nodeEnter.append('text').attr('dy',20).attr('text-anchor','middle').attr('font-size',9).attr('fill','#444');
+        const allNodes = nodeEnter.merge(nodeSel);
+        allNodes.select('circle').attr('fill', d => d.isEnabled ? '#27ae60' : '#bbb');
+        allNodes.select('text').text(d => d.name.length>18 ? d.name.slice(0,16)+'…' : d.name);
+      }
+
+      svg.on('click', () => { detail.className = 'node-detail'; });
+
+      sim.on('tick', () => {
+        linkG.selectAll('line')
+          .attr('x1',d=>d.source.x).attr('y1',d=>d.source.y)
+          .attr('x2',d=>d.target.x).attr('y2',d=>d.target.y);
+        nodeG.selectAll('g').attr('transform',d=>'translate('+d.x+','+d.y+')');
+      });
+
+      redraw();
+
+      window.toggleWfEdge = function(type, btn) {
+        if (activeTypes.has(type)) { activeTypes.delete(type); btn.style.background='#eee'; btn.style.color='#555'; btn.classList.remove('active'); }
+        else { activeTypes.add(type); btn.style.background=EDGE_COLORS[type]; btn.style.color='white'; btn.classList.add('active'); }
+        redraw();
+      };
+      window.filterWfNodes = function() {
+        searchFilter = document.getElementById('wf-search').value.toLowerCase();
+        redraw();
+      };
+    })();
+
+    // ── Findings filter ───────────────────────────────────────────────────────
     function filterFindings() {
       const sev = document.querySelector('.filter-bar select').value;
       const obj = document.getElementById('object-filter').value;
@@ -1443,7 +1850,7 @@ async function main() {
   if (validations.length > 0) console.log(`  Found ${validations.length} property validation rule(s)`);
 
   // 6. Workflows
-  let workflows = [], workflowFindings = [];
+  let workflows = [], workflowFindings = [], workflowConnections = null;
   if (AUDIT_WORKFLOWS) {
     console.log('\n[6/8] Auditing workflows...');
     workflows = await getWorkflows();
@@ -1454,6 +1861,8 @@ async function main() {
     const wfCrit = workflowFindings.filter((f) => f.severity === 'critical').length;
     const wfWarn = workflowFindings.filter((f) => f.severity === 'warning').length;
     console.log(`  ${workflowFindings.length} findings: ${wfCrit} critical, ${wfWarn} warnings`);
+    workflowConnections = buildWorkflowConnections(workflows);
+    console.log(`  Connection graph: ${workflowConnections.nodes.length} nodes, ${workflowConnections.edges.length} edges`);
   } else {
     console.log('\n[6/8] Workflows skipped (set AUDIT_WORKFLOWS=1 to enable)');
   }
@@ -1489,6 +1898,7 @@ async function main() {
     validations,
     workflows,
     workflowFindings,
+    workflowConnections,
     findings,
     fixPlan,
   };
